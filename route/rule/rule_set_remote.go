@@ -49,6 +49,7 @@ type RemoteRuleSet struct {
 	metadata       adapter.RuleSetMetadata
 	lastUpdated    time.Time
 	lastEtag       string
+	startedEmpty   bool
 	cacheFile      adapter.CacheFile
 	pauseManager   pause.Manager
 	callbacks      list.List[adapter.RuleSetUpdateCallback]
@@ -132,7 +133,10 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
 		err = s.fetch(ctx, true)
 		if err != nil {
-			return E.Cause(err, "initial rule-set: ", s.tag)
+			// Start with an empty rule-set instead of failing the whole start:
+			// RuleSetUpdater keeps retrying until the first download succeeds.
+			s.logger.Error(E.Cause(err, "initial rule-set: ", s.tag, ", starting empty and retrying"))
+			s.startedEmpty = true
 		}
 	}
 	return nil
