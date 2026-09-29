@@ -756,7 +756,7 @@ func stripDNSPadding(response *dns.Msg) {
 }
 
 func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg) (*dns.Msg, error) {
-	response, err := transport.Exchange(ctx, message)
+	response, err := c.exchangeTransport(ctx, transport, message)
 	if err == nil {
 		stripDNSPadding(response)
 		return response, nil
@@ -769,7 +769,7 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
 }
 
 func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, callback func(response *dns.Msg, err error)) {
-	transport.ExchangeAsync(ctx, message, func(response *dns.Msg, err error) {
+	c.exchangeTransportAsync(ctx, transport, message, func(response *dns.Msg, err error) {
 		if err == nil {
 			stripDNSPadding(response)
 			callback(response, nil)
