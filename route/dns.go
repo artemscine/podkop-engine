@@ -13,6 +13,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/udpnat2"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -43,6 +44,9 @@ func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetB
 	if err != nil {
 		N.ReleaseMultiPacketBuffer(packetBuffers)
 		err = E.Cause(err, "report handshake success")
+	} else if natConn, isNatConn := conn.(udpnat.Conn); isNatConn {
+		r.hijackDNSNatConn(ctx, natConn, packetBuffers, metadata, onClose) // see dns_nat.go
+		return nil
 	} else {
 		err = dnsOutbound.NewDNSPacketConnection(ctx, r.dns, conn, packetBuffers, metadata)
 	}
