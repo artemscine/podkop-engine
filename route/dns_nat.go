@@ -49,7 +49,11 @@ func (h *dnsNatHandler) NewPacketEx(buffer *buf.Buffer, destination M.Socksaddr)
 		return
 	}
 	metadata := h.metadata
-	h.router.dns.ExchangeAsync(adapter.WithContext(h.ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+	// Not on the caller: udpnat calls NewPacketEx from the reading loop of the inbound,
+	// which serves every session, and an exchange can wait (a new FakeIP address is
+	// written to the cache file, a DoT connection is being set up). The goroutine lives as
+	// long as ExchangeAsync itself, not for the session.
+	go h.router.dns.ExchangeAsync(adapter.WithContext(h.ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
 		if exchangeErr == nil {
 			exchangeErr = h.router.writeDNSPacketResponse(&message, response, h.conn, destination)
 		}
