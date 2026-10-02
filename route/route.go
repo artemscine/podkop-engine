@@ -542,6 +542,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	return result
 }
 
+// errMissingFakeIPRecord: a connection to a FakeIP address the store has no record for. The
+// store forgets an address that was given out shortly before a crash, or that nobody used
+// for a long time; a client may still hold it.
+var errMissingFakeIPRecord = E.New("missing fakeip record")
+
 func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.InboundContext) error {
 	r.searchProcessInfo(ctx, metadata)
 	if r.neighborResolver != nil && metadata.SourceMACAddress == nil && metadata.Source.Addr.IsValid() {
@@ -564,7 +569,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
 		if !loaded {
-			return E.New("missing fakeip record, try enable `experimental.cache_file`")
+			return errMissingFakeIPRecord
 		}
 		if domain != "" {
 			metadata.OriginDestination = metadata.Destination
@@ -598,6 +603,23 @@ func (r *Router) matchRule(
 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
 ) {
 	fatalErr = r.prepareMatchMetadata(ctx, metadata)
+	// A connection to a FakeIP address without a record is not refused at once: if a rule
+	// sniffs it and the client names the domain itself (TLS, HTTP, QUIC), that domain is
+	// where it goes, as if the record were there. Without a name it is refused once the
+	// rules are through.
+	missingFakeIP := errors.Is(fatalErr, errMissingFakeIPRecord)
+	if missingFakeIP {
+		fatalErr = nil
+		defer func() {
+			if missingFakeIP && fatalErr == nil {
+				selectedRule = nil
+				buf.ReleaseMulti(buffers)
+				N.ReleaseMultiPacketBuffer(packetBuffers)
+				buffers, packetBuffers = nil, nil
+				fatalErr = errMissingFakeIPRecord
+			}
+		}()
+	}
 	if fatalErr != nil {
 		return
 	}
@@ -678,6 +700,16 @@ match:
 			if newErr != nil {
 				fatalErr = newErr
 				return
+			}
+			if missingFakeIP && M.IsDomainName(metadata.Domain) {
+				missingFakeIP = false
+				metadata.OriginDestination = metadata.Destination
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.Domain,
+					Port: metadata.Destination.Port,
+				}
+				metadata.FakeIP = true
+				r.logger.InfoContext(ctx, "missing fakeip record, sniffed domain used: ", metadata.Domain)
 			}
 		case *R.RuleActionResolve:
 			fatalErr = r.actionResolve(ctx, metadata, action)
