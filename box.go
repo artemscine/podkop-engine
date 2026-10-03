@@ -543,6 +543,11 @@ func (s *Box) preStart() error {
 	}
 	s.scope.Add(s.logFactory.Close)
 	applyDebugOptions(s.debugOptions)
+	stopMemoryLimit := startMemoryLimit(s.logger, s.debugOptions)
+	s.scope.Add(func() error {
+		stopMemoryLimit()
+		return nil
+	})
 	debugHTTPServer, err := startDebugHTTPServer(s.debugOptions)
 	if err != nil {
 		return err
