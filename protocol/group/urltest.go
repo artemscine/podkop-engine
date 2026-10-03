@@ -455,8 +455,12 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				return member
 			})), link, interval, force)
 		default:
+			// A member that some group tested within this round is not tested again. The
+			// group's own test from the previous round must not count: it finished at most
+			// one test timeout after that round began, so it is at least interval minus that
+			// timeout old. Comparing with the whole interval made every other round skip it.
 			history := b.history.LoadURLTestHistory(tag)
-			if !force && history != nil && time.Since(history.Time) < interval {
+			if !force && history != nil && time.Since(history.Time) < interval-C.TCPTimeout {
 				continue
 			}
 			b.checked[tag] = true
