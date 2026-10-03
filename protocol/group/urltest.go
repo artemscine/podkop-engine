@@ -178,8 +178,18 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		if N.NetworkName(network) == N.NetworkTCP {
 			s.group.memberSucceeded(outbound)
 		}
+		var handshake *handshakeConn
 		if N.NeedHandshakeForWrite(conn) {
-			conn = &handshakeConn{Conn: conn, failed: func(err error) { s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, time.Time{}) }}
+			handshake = &handshakeConn{Conn: conn, failed: func(err error) { s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, time.Time{}) }}
+			conn = handshake
+		}
+		if N.NetworkName(network) == N.NetworkTCP {
+			if watched, isWatched := s.group.watchResponse(conn, outbound, destination).(*responseConn); isWatched {
+				if handshake != nil {
+					handshake.writing = watched.wrote // a write held back by the transport starts the clock
+				}
+				conn = watched
+			}
 		}
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
@@ -242,10 +252,13 @@ type URLTestGroup struct {
 	updatePending                atomic.Bool
 	confirmAccess                sync.Mutex
 	confirms                     map[string]*memberConfirm
+	unansweredConfirms           map[string]*memberConfirm
 	epoch                        time.Time
 	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
 	downloadLink                 string
 	frozen                       common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+	responses                    sync.Map                                // member tag → *memberResponses
+	responsesClosed              atomic.Bool
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -309,6 +322,7 @@ func (g *URLTestGroup) Touch() {
 }
 
 func (g *URLTestGroup) Close() error {
+	g.responsesClosed.Store(true)
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.ticker == nil {
@@ -529,6 +543,11 @@ func (g *URLTestGroup) performUpdateCheck() {
 
 // updateSelection is performUpdateCheck under its lock.
 func (g *URLTestGroup) updateSelection() {
+	if g.downloadLink != "" {
+		// new dials already pass over a member without a test result while the selection
+		// waits (selectionPending), which the download test may make long
+		g.closeUnanswered()
+	}
 	var (
 		updated  bool
 		selected bool
@@ -559,4 +578,5 @@ func (g *URLTestGroup) updateSelection() {
 	if selected {
 		g.history.NotifyUpdated()
 	}
+	g.closeUnanswered()
 }
