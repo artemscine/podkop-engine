@@ -50,6 +50,7 @@ type Client struct {
 	cache             *freelru.Cache[dnsCacheKey, *dns.Msg]
 	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
+	failures          failureLog
 }
 
 type ClientOptions struct {
@@ -755,7 +756,7 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
 	if errors.As(err, &rcodeError) {
 		return FixedResponseStatus(message, int(rcodeError)), nil
 	}
-	return nil, err
+	return nil, c.failures.failed(ctx, c.logger, transport.Tag(), message, err)
 }
 
 func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, callback func(response *dns.Msg, err error)) {
@@ -770,7 +771,7 @@ func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter
 			callback(FixedResponseStatus(message, int(rcodeError)), nil)
 			return
 		}
-		callback(nil, err)
+		callback(nil, c.failures.failed(ctx, c.logger, transport.Tag(), message, err))
 	})
 }
 

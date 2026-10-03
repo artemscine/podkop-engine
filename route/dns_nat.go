@@ -5,6 +5,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/dns"
 	R "github.com/sagernet/sing-box/route/rule"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -57,7 +58,7 @@ func (h *dnsNatHandler) NewPacketEx(buffer *buf.Buffer, destination M.Socksaddr)
 		if exchangeErr == nil {
 			exchangeErr = h.router.writeDNSPacketResponse(&message, response, h.conn, destination)
 		}
-		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
+		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) && !dns.IsLoggedFailure(exchangeErr) {
 			h.router.logger.ErrorContext(h.ctx, E.Cause(exchangeErr, "process DNS packet"))
 		}
 	})

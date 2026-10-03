@@ -531,7 +531,7 @@ func (r *Router) settleDNSFutures(ctx context.Context, message *mDNS.Msg, state 
 			continue
 		}
 		future.settled = true
-		if future.err != nil && !future.terminal {
+		if future.err != nil && !future.terminal && !IsLoggedFailure(future.err) {
 			r.logger.ErrorContext(ctx, E.Cause(future.err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
 		}
 		if future.tag == "" {
@@ -1174,10 +1174,12 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
 			} else if errors.Is(err, ErrResponseRejected) {
 				rejected = true
 				r.logger.DebugContext(ctx, E.Cause(err, "response rejected for ", FormatQuestion(message.Question[0].String())))
-			} else if len(message.Question) > 0 {
-				r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
-			} else {
-				r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for <empty query>"))
+			} else if !IsLoggedFailure(err) {
+				if len(message.Question) > 0 {
+					r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for ", FormatQuestion(message.Question[0].String())))
+				} else {
+					r.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for <empty query>"))
+				}
 			}
 		}
 		if responseCheck != nil && rejected {
@@ -1272,7 +1274,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 				r.logger.DebugContext(ctx, "lookup rejected for ", domain)
 			} else if errors.Is(err, ErrNotCached) {
 				r.logger.DebugContext(ctx, "cache-only lookup missed for ", domain)
-			} else {
+			} else if !IsLoggedFailure(err) {
 				r.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
 			}
 		}
