@@ -38,7 +38,6 @@ import (
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing-box/protocol/vmess"
 	originca "github.com/sagernet/sing-box/service/origin_ca"
-	"github.com/sagernet/sing-box/service/resolved"
 	"github.com/sagernet/sing-box/service/ssmapi"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -127,7 +126,6 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 	local.RegisterTransport(registry)
 	mdns.RegisterTransport(registry)
 	fakeip.RegisterTransport(registry)
-	resolved.RegisterTransport(registry)
 
 	registerQUICTransports(registry)
 	registerDHCPTransport(registry)
@@ -142,7 +140,6 @@ func ServiceRegistry() *service.Registry {
 	registry := service.NewRegistry()
 
 	registerAPIService(registry)
-	resolved.RegisterService(registry)
 	ssmapi.RegisterService(registry)
 
 	registerQUICServices(registry)
