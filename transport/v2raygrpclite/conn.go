@@ -56,6 +56,13 @@ func (c *GunConn) setup(reader io.Reader, err error) {
 		c.reader = std_bufio.NewReader(reader)
 	}
 	c.err = err
+	if err != nil {
+		// the client has closed the request-body pipe with the error; cancel the request
+		// too, so that the transport lets its goroutine go
+		if c.cancel != nil {
+			c.cancel()
+		}
+	}
 	close(c.create)
 }
 
