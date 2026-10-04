@@ -363,6 +363,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				packetSniffers = defaultPacketSniffers
 			}
 			sniffErr := sniff.PeekPacket(ctx, &metadata, firstPacket, packetSniffers...)
+			r.logSnifferPanic(ctx, sniffErr)
 			metadata.SnifferNames = action.SnifferNames
 			metadata.SniffError = sniffErr
 			if sniffErr != nil {
@@ -793,6 +794,21 @@ match:
 	return
 }
 
+// maxSniffPackets bounds the packets a UDP sniff reads and holds. A client that keeps
+// sending packets the sniffer needs more of (QUIC Initials whose CRYPTO frames never
+// complete a ClientHello) would keep it reading, each packet held in a buffer of its own,
+// for as long as every one comes within the timeout. A ClientHello takes few packets:
+// QUIC pads every client Initial to 1200 bytes (RFC 9000, section 14.1), and the largest
+// ClientHellos browsers send, with a post-quantum key share, take two.
+const maxSniffPackets = 16
+
+// logSnifferPanic logs a sniffer that panicked, with its stack: a bug to report.
+func (r *Router) logSnifferPanic(ctx context.Context, err error) {
+	if errors.Is(err, sniff.ErrSnifferPanicked) {
+		r.logger.ErrorContext(ctx, err)
+	}
+}
+
 func (r *Router) actionSniff(
 	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
 	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
@@ -834,6 +850,7 @@ func (r *Router) actionSniff(
 			action.Timeout,
 			streamSniffers...,
 		)
+		r.logSnifferPanic(ctx, err)
 		metadata.SnifferNames = action.SnifferNames
 		metadata.SniffError = err
 		if err == nil {
@@ -899,6 +916,11 @@ func (r *Router) actionSniff(
 			goto finally
 		}
 		for {
+			if len(inputPacketBuffers)+len(packetBuffers) >= maxSniffPackets {
+				err = E.New("no sniff result in ", maxSniffPackets, " packets")
+				metadata.SniffError = err
+				goto finally
+			}
 			var (
 				sniffBuffer = buf.NewPacket()
 				destination M.Socksaddr
@@ -959,6 +981,7 @@ func (r *Router) actionSniff(
 			goto finally
 		}
 	finally:
+		r.logSnifferPanic(ctx, err)
 		if err == nil {
 			//goland:noinspection GoDeprecation
 			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
