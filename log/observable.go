@@ -26,6 +26,7 @@ type defaultFactory struct {
 	platformWriters   atomic.Pointer[[]PlatformWriter]
 	needConsole       bool
 	needObservable    bool
+	subscriptions     atomic.Int32 // entries are formatted for the observer only while it has some
 	level             Level
 	subscriber        *observable.Subscriber[Entry]
 	observer          *observable.Observer[Entry]
@@ -139,11 +140,23 @@ func (f *defaultFactory) NewLogger(tag string) ContextLogger {
 }
 
 func (f *defaultFactory) Subscribe() (subscription observable.Subscription[Entry], done <-chan struct{}, err error) {
-	return f.observer.Subscribe()
+	subscription, done, err = f.observer.Subscribe()
+	if err == nil {
+		f.subscriptions.Add(1)
+	}
+	return
 }
 
 func (f *defaultFactory) UnSubscribe(sub observable.Subscription[Entry]) {
+	f.subscriptions.Add(-1)
 	f.observer.UnSubscribe(sub)
+}
+
+// observed reports whether an entry goes to the observer: with the Clash API on, and only
+// while someone reads its logs. Formatting every entry below the level for nobody cost each
+// log call of the router and DNS some ten times the call itself.
+func (f *defaultFactory) observed() bool {
+	return f.needObservable && f.subscriptions.Load() > 0
 }
 
 func (f *defaultFactory) output(ctx context.Context, level Level, tag string, message string, timestamp time.Time) {
@@ -157,7 +170,7 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
 			os.Exit(1)
 		}
 	}
-	if f.needObservable {
+	if f.observed() {
 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
 	}
 	platformWriters := f.loadPlatformWriters()
@@ -179,7 +192,7 @@ type observableLogger struct {
 func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 	level = OverrideLevelFromContext(level, ctx)
 	platformWriters := l.loadPlatformWriters()
-	if level > l.level && len(platformWriters) == 0 && !l.needObservable {
+	if level > l.level && len(platformWriters) == 0 && !l.observed() {
 		return
 	}
 	nowTime := time.Now()
