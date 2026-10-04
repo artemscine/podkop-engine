@@ -56,6 +56,11 @@ type RemoteRuleSet struct {
 	pauseManager   pause.Manager
 	callbacks      list.List[adapter.RuleSetUpdateCallback]
 	refs           atomic.Int32
+	// the updater's own: whether the last fetch loaded a list, and the failed updates
+	// since the last success (see fetchFailed)
+	fetchLoaded   bool
+	failures      int
+	failureLogged time.Time
 }
 
 func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
@@ -256,12 +261,42 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 	return nil
 }
 
-func (s *RemoteRuleSet) updateOnce() {
+// updateOnce updates the rule-set and reports whether it loaded a new list.
+func (s *RemoteRuleSet) updateOnce() bool {
+	s.fetchLoaded = false
 	err := s.fetch(s.ctx, false)
 	if err != nil {
-		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
-	} else if s.refs.Load() == 0 {
+		s.fetchFailed(err)
+		return false
+	}
+	if s.failures > 0 {
+		s.logger.Info("fetch rule-set ", s.tag, ": succeeded after ", s.failures, " failed attempts")
+		s.failures = 0
+	}
+	if s.refs.Load() == 0 {
 		s.dropRules()
+	}
+	return s.fetchLoaded
+}
+
+// ruleSetFailureLogInterval is how often a rule-set that keeps failing to update logs its
+// failures as an error.
+const ruleSetFailureLogInterval = 10 * time.Minute
+
+// fetchFailed logs a failed update: the first of a series as an error, then a count with
+// the last error once every ruleSetFailureLogInterval, the others at debug. A list that
+// never came at the start is retried every 30 s, which logged 2880 errors a day.
+func (s *RemoteRuleSet) fetchFailed(err error) {
+	s.failures++
+	switch {
+	case s.failures == 1:
+		s.failureLogged = time.Now()
+		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
+	case time.Since(s.failureLogged) >= ruleSetFailureLogInterval:
+		s.failureLogged = time.Now()
+		s.logger.Error("fetch rule-set ", s.tag, ": ", s.failures, " failed attempts, the last: ", err)
+	default:
+		s.logger.Debug("fetch rule-set ", s.tag, ": ", err)
 	}
 }
 
@@ -376,6 +411,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
+	s.fetchLoaded = true
 	eTagHeader := response.Header.Get("Etag")
 	if eTagHeader != "" {
 		s.lastEtag = eTagHeader
