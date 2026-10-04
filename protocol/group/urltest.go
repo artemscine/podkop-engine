@@ -472,26 +472,28 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
 }
 
 // URLTest is the Clash API's round: it does not wait for the selection, which may run a
-// download test.
+// download test, nor for those of the nested urltest groups.
 func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
-	result, err := g.urlTestRound(ctx, true)
+	result, err := g.urlTestRound(ctx, true, false)
 	g.requestUpdateCheck()
 	return result, err
 }
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	result, err := g.urlTestRound(ctx, force)
+	result, err := g.urlTestRound(ctx, force, true)
 	g.performUpdateCheck()
 	return result, err
 }
 
 // urlTestRound tests the members, one round at a time; the selection is not part of the round.
-func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool) (map[string]uint16, error) {
+// With wait, a nested urltest group among the members selects within the round (see
+// URLTestOutbounds).
+func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
 	if g.checking.Swap(true) {
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
-	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force), nil
+	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait), nil
 }
 
 type urlTestResult struct {
@@ -507,11 +509,17 @@ type urlTestBatch struct {
 	batch    *batch.Batch[any]
 	checked  map[string]bool
 	groups   []adapter.OutboundGroup
+	wait     bool
 	access   sync.Mutex
 	result   map[string]uint16
 }
 
-func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
+// URLTestOutbounds tests outbounds and, through them, the members of nested groups. A nested
+// urltest group runs its own round and then selects. With wait, the call returns after
+// that selection: a periodic round of the group above selects by the nested group's new
+// choice. Without, the selection runs after the call returns: the Clash API answers its
+// client in time, while the selection may run a download test of up to 15 s per candidate.
+func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	testBatch := &urlTestBatch{
 		ctx:      ctx,
@@ -520,6 +528,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		logger:   logger,
 		batch:    b,
 		checked:  make(map[string]bool),
+		wait:     wait,
 		result:   make(map[string]uint16),
 	}
 	testBatch.test(outbounds, link, interval, force)
@@ -544,7 +553,13 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
 			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
+				var nestedResult map[string]uint16
+				if b.wait {
+					nestedResult, _ = nested.group.urlTest(b.ctx, force)
+				} else {
+					nestedResult, _ = nested.group.urlTestRound(b.ctx, force, false)
+					nested.group.requestUpdateCheck()
+				}
 				b.access.Lock()
 				maps.Copy(b.result, nestedResult)
 				b.access.Unlock()
