@@ -56,6 +56,17 @@ func testURL(t *testing.T, delay time.Duration) (string, *atomic.Int32) {
 	return server.URL, &requests
 }
 
+// testOutboundManager finds the members of a test group by tag.
+type testOutboundManager struct {
+	adapter.OutboundManager
+	members map[string]adapter.Outbound
+}
+
+func (m *testOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
+	member, loaded := m.members[tag]
+	return member, loaded
+}
+
 // The periodic test runs every interval: this group's own result from the previous round is
 // not fresh any more, while a result another group got within this round is.
 func TestURLTestFreshness(t *testing.T) {
