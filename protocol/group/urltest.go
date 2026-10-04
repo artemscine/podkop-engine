@@ -44,6 +44,7 @@ type URLTest struct {
 	logger                       log.ContextLogger
 	tags                         []string
 	link                         string
+	downloadLink                 string
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
@@ -73,6 +74,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, E.New("duplicate tag: ", tag)
 		}
 	}
+	var err error
+	outbound.downloadLink, err = groupDownloadLink(options.DownloadURL)
+	if err != nil {
+		return nil, err
+	}
 	return outbound, nil
 }
 
@@ -87,7 +93,7 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			outbounds = append(outbounds, detour)
 		}
-		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 		if err != nil {
 			return err
 		}
@@ -274,7 +280,7 @@ type URLTestGroup struct {
 	responsesClosed              atomic.Bool
 }
 
-func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -306,7 +312,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
 		epoch:                        time.Now(),
-		downloadLink:                 downloadTestLink,
+		downloadLink:                 downloadLink,
 	}, nil
 }
 
