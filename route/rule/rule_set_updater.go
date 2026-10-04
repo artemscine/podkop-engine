@@ -57,12 +57,14 @@ func (u *RuleSetUpdater) loopUpdate() {
 		case <-timer.C:
 		}
 		now := time.Now()
-		var updated bool
+		var loaded bool
 		for i, ruleSet := range u.ruleSets {
 			if now.Before(nextUpdates[i]) {
 				continue
 			}
-			ruleSet.updateOnce()
+			if ruleSet.updateOnce() {
+				loaded = true
+			}
 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
 			if ruleSet.startedEmpty {
 				if ruleSet.lastUpdated.IsZero() {
@@ -75,9 +77,10 @@ func (u *RuleSetUpdater) loopUpdate() {
 					notifyRuleSetRecovered(ruleSet.logger, ruleSet.tag)
 				}
 			}
-			updated = true
 		}
-		if updated {
+		// the old list is garbage once a new one is loaded; a failed or not-modified
+		// update leaves nothing to collect
+		if loaded {
 			runtime.GC()
 		}
 		timer.Reset(waitUntilNext(nextUpdates))
