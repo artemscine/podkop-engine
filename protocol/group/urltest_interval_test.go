@@ -84,7 +84,7 @@ func TestURLTestFreshness(t *testing.T) {
 			member := newTestMember(C.TypeVLESS, "member", dialWorking)
 			history := urltest.NewHistoryStorage()
 			history.StoreURLTestHistory("member", &adapter.URLTestHistory{Time: time.Now().Add(-testCase.age), Delay: 10})
-			URLTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, link, interval, false)
+			URLTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, link, interval, false, true)
 			require.Equal(t, testCase.tested, member.dials.Load() > 0)
 		})
 	}

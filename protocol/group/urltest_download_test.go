@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -250,6 +251,51 @@ func TestURLTestClashPathsDoNotWait(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the Clash API paths waited for the selection")
+	}
+}
+
+// The Clash API's delay test of a group with a nested urltest group (a selector, or a
+// urltest group of groups) does not wait for the nested group's selection either, which
+// then runs afterwards; the periodic round of the group above does wait for it.
+func TestURLTestClashPathsDoNotWaitForNested(t *testing.T) {
+	link, _ := testURL(t, 0)
+	a := newTestMember(C.TypeVLESS, "a", dialWorking)
+	_, nestedGroup := newTestURLTest(t, link, a)
+	nested := &URLTest{Adapter: outbound.NewAdapter(C.TypeURLTest, "nested", []string{N.NetworkTCP, N.NetworkUDP}, nil), group: nestedGroup}
+	manager := &testOutboundManager{members: map[string]adapter.Outbound{"a": a, "nested": nested}}
+	nestedGroup.outbound = manager
+	parent, err := NewURLTestGroup(service.ContextWithPtr(context.Background(), nestedGroup.history), manager, log.NewNOPFactory().Logger(),
+		[]adapter.Outbound{nested}, nil, link, "", time.Minute, 50, 0, false)
+	require.NoError(t, err)
+
+	nestedGroup.updateAccess.Lock() // as a download test would
+	done := make(chan struct{})
+	go func() {
+		URLTestOutbounds(context.Background(), manager, nestedGroup.history, log.NewNOPFactory().Logger(), []adapter.Outbound{nested}, link, 0, true, false)
+		_, _ = parent.URLTest(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the Clash API paths waited for the selection of the nested group")
+	}
+
+	waited := make(chan struct{})
+	go func() {
+		_, _ = parent.urlTest(context.Background(), true)
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("the periodic round did not wait for the selection of the nested group")
+	case <-time.After(200 * time.Millisecond):
+	}
+	nestedGroup.updateAccess.Unlock()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the periodic round did not end after the selection")
 	}
 }
 
