@@ -5,13 +5,16 @@ package v2rayxhttp
 import (
 	"context"
 	stdTLS "crypto/tls"
+	"net"
 	"net/http"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/tls"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common/bufio"
@@ -28,6 +31,30 @@ const quicKeepAlivePeriod = 10 * time.Second
 // connection.
 type http3Connection struct {
 	transport *http3.Transport
+	// conns are the QUIC connections dialed: http3.Transport forgets one whose
+	// request failed without closing it, and its keep-alive then holds it,
+	// its socket and its goroutines open.
+	access sync.Mutex
+	conns  map[*quic.Conn]struct{}
+	closed bool
+}
+
+func (c *http3Connection) track(conn *quic.Conn) bool {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.closed {
+		return false
+	}
+	if c.conns == nil {
+		c.conns = make(map[*quic.Conn]struct{})
+	}
+	c.conns[conn] = struct{}{}
+	context.AfterFunc(conn.Context(), func() {
+		c.access.Lock()
+		delete(c.conns, conn)
+		c.access.Unlock()
+	})
+	return true
 }
 
 func newHTTP3Connections(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.Config, keepAlivePeriod time.Duration) (func() pooledConnection, error) {
@@ -67,10 +94,20 @@ func newHTTP3Connections(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.
 		ChromeParrot:            chromeParrot,
 	}
 	return func() pooledConnection {
-		return &http3Connection{transport: &http3.Transport{
+		connection := &http3Connection{}
+		connection.transport = &http3.Transport{
 			TLSClientConfig: stdConfig,
 			QUICConfig:      quicConfig,
 			Dial: func(ctx context.Context, addr string, tlsConfig *tls.STDConfig, quicConfig *quic.Config) (*quic.Conn, error) {
+				// The connection is shared: the session whose request started
+				// the dial must not take it down, by closing, for the sessions
+				// waiting for it.
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), C.TCPTimeout)
+				defer cancel()
+				// http3.Transport fills an empty server name from the request's
+				// host, which would undo disable_sni.
+				tlsConfig = tlsConfig.Clone()
+				tlsConfig.ServerName = stdConfig.ServerName
 				conn, err := dialer.DialContext(ctx, N.NetworkUDP, serverAddr)
 				if err != nil {
 					return nil, err
@@ -87,9 +124,14 @@ func newHTTP3Connections(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.
 				})
 				// BBR with the standard profile, as Xray's HTTP/3 uses.
 				quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(quicConn.InitialPacketSize(), congestion_meta2.ProfileStandard))
+				if !connection.track(quicConn) {
+					quicConn.CloseWithError(0, "")
+					return nil, net.ErrClosed
+				}
 				return quicConn, nil
 			},
-		}}
+		}
+		return connection
 	}, nil
 }
 
@@ -99,4 +141,12 @@ func (c *http3Connection) roundTrip(request *http.Request) (*http.Response, erro
 
 func (c *http3Connection) close() {
 	c.transport.Close()
+	c.access.Lock()
+	conns := c.conns
+	c.conns = nil
+	c.closed = true
+	c.access.Unlock()
+	for conn := range conns {
+		conn.CloseWithError(0, "")
+	}
 }
