@@ -1,9 +1,12 @@
 package option
 
 import (
+	"context"
+	"reflect"
 	"testing"
 
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/schema"
 	"github.com/sagernet/sing/common/json"
 
 	"github.com/stretchr/testify/require"
@@ -121,5 +124,13 @@ func TestV2RayXHTTPUnknownFields(t *testing.T) {
 	} {
 		var options V2RayTransportOptions
 		require.Error(t, json.Unmarshal([]byte(input), &options), input)
+	}
+}
+
+func TestV2RayXHTTPSchema(t *testing.T) {
+	content, err := schema.Generate(context.Background(), reflect.TypeFor[V2RayTransportOptions]())
+	require.NoError(t, err)
+	for _, expected := range []string{`"xhttp"`, `"V2RayXHTTPRange"`, `"sc_max_each_post_bytes"`, `"session_id_table"`, `"download"`, `"h_keep_alive_period"`} {
+		require.Contains(t, string(content), expected)
 	}
 }
