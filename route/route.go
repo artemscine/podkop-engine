@@ -61,7 +61,7 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
 			r.logger.DebugContext(ctx, "connection closed: ", err)
-		} else {
+		} else if !r.logRefused(ctx, metadata.Destination, err) {
 			r.logger.ErrorContext(ctx, err)
 		}
 	}
@@ -191,7 +191,7 @@ func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn.Close()
 		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
 			r.logger.DebugContext(ctx, "connection closed: ", err)
-		} else {
+		} else if !r.logRefused(ctx, metadata.Destination, err) {
 			r.logger.ErrorContext(ctx, err)
 		}
 	}
@@ -208,7 +208,7 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
 			r.logger.DebugContext(ctx, "connection closed: ", err)
-		} else {
+		} else if !r.logRefused(ctx, metadata.Destination, err) {
 			r.logger.ErrorContext(ctx, err)
 		}
 	}
@@ -555,6 +555,17 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 // store forgets an address that was given out shortly before a crash, or that nobody used
 // for a long time; a client may still hold it.
 var errMissingFakeIPRecord = E.New("missing fakeip record")
+
+// logRefused logs a connection the router refuses by design, which is no failure of the
+// router: it tells whether err was such a refusal. destination is where the connection
+// came in for.
+func (r *Router) logRefused(ctx context.Context, destination M.Socksaddr, err error) bool {
+	if errors.Is(err, errMissingFakeIPRecord) {
+		r.logger.WarnContext(ctx, "connection to ", destination, " refused: no fakeip record (the address was given out shortly before a crash, was flushed, or was unused for a long time); the client gets a new one when it resolves the name again")
+		return true
+	}
+	return false
+}
 
 func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.InboundContext) error {
 	r.searchProcessInfo(ctx, metadata)
