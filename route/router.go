@@ -47,6 +47,7 @@ type Router struct {
 	pauseManager      pause.Manager
 	trackers          []adapter.ConnectionTracker
 	platformInterface adapter.PlatformInterface
+	loopRefusals      loopRefusalLog
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
