@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -71,6 +72,7 @@ type fallbackServer struct {
 	options option.RemoteDNSServerOptions
 
 	decideOnce sync.Once
+	decided    atomic.Bool // eligible is set
 	eligible   bool
 	dialer     N.Dialer
 
@@ -181,6 +183,7 @@ func probeServer(ctx context.Context, logger logger.ContextLogger, transport ada
 // of the box.
 func (s *fallbackServer) decide(ctx context.Context, logger logger.ContextLogger, tag string) bool {
 	s.decideOnce.Do(func() {
+		defer s.decided.Store(true)
 		var reason string
 		if ctx == nil {
 			reason = "no context"
@@ -431,11 +434,17 @@ func (c *Client) exchangeTransport(ctx context.Context, transport adapter.DNSTra
 }
 
 // exchangeTransportAsync is the path of queries hijacked from clients. Servers without
-// the fallback keep the transport's own asynchronous exchange.
+// the fallback keep the transport's own asynchronous exchange. The caller reads the next
+// queries of the client and must not wait: the first query to a server, which decides
+// and reads the provider's servers (an exec of ubus), does it on the goroutine too.
 func (c *Client) exchangeTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
-	if state := fallbackFor(transport); state != nil && state.decide(c.ctx, c.logger, transport.Tag()) {
+	if state := fallbackFor(transport); state != nil && (!state.decided.Load() || state.eligible) {
 		go func() {
-			callback(exchangeWithFallback(ctx, c.ctx, c.logger, transport, state, message))
+			if state.decide(c.ctx, c.logger, transport.Tag()) {
+				callback(exchangeWithFallback(ctx, c.ctx, c.logger, transport, state, message))
+			} else {
+				transport.ExchangeAsync(ctx, message, callback)
+			}
 		}()
 		return
 	}
