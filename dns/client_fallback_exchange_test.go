@@ -93,7 +93,7 @@ func newFallbackTest(providers ...M.Socksaddr) (*fallbackTestTransport, *fallbac
 			readAt:  time.Now(),
 		},
 	}
-	state.decideOnce.Do(func() {})
+	state.decideOnce.Do(func() { state.decided.Store(true) })
 	transport := &fallbackTestTransport{
 		TransportAdapter: TransportAdapter{transportType: "test", transportTag: "dns-server", fallback: state},
 		handler:          fallbackTestAnswers,
@@ -643,5 +643,125 @@ func TestProviderListRereadAfterMiss(t *testing.T) {
 	state.providers.list(context.Background(), nil)
 	if reads.Load() != 2 {
 		t.Errorf("the list was read %d times, want 2: a reset reads it at the next use", reads.Load())
+	}
+}
+
+// The first query to a server decides whether the fallback applies and reads the
+// provider's servers. A hijacked query does not wait for that on the goroutine of its
+// caller, which reads the next queries of the client.
+func TestExchangeTransportAsyncFirstQuery(t *testing.T) {
+	t.Parallel()
+	read := make(chan struct{})
+	state := &fallbackServer{
+		options: option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "77.88.8.8"}},
+		providers: &providerSet{read: func(ctx context.Context) ([]netifdInterface, error) {
+			<-read
+			return nil, E.New("no ubus in tests")
+		}},
+	}
+	transport := &fallbackTestTransport{
+		TransportAdapter: TransportAdapter{transportType: "test", transportTag: "dns-server", fallback: state},
+		handler:          fallbackTestAnswers,
+	}
+	client := &Client{ctx: context.Background()}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	results := make(chan error, 4)
+	returned := make(chan struct{})
+	go func() {
+		client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
+			results <- err
+		})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Error("exchangeTransportAsync waits for the read of the provider's servers")
+	}
+	close(read)
+	<-returned
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("query %d: %v", i, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("query %d: the callback was not called", i)
+		}
+		if !state.eligible {
+			t.Fatal("the server does not qualify: its first query read no provider list")
+		}
+		if i == 0 { // the decision is taken now
+			client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
+				results <- err
+			})
+		}
+	}
+	select {
+	case <-results:
+		t.Error("a callback was called twice")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// The first hijacked query to a server that turns out not to qualify is decided on the
+// goroutine as well and is then answered by the server alone, once; the provider's
+// servers are not read for it.
+func TestExchangeTransportAsyncFirstQueryNoFallback(t *testing.T) {
+	t.Parallel()
+	reads := new(atomic.Int32)
+	state := &fallbackServer{
+		options: option.RemoteDNSServerOptions{DNSServerAddressOptions: option.DNSServerAddressOptions{Server: "192.168.1.1"}},
+		providers: &providerSet{read: func(ctx context.Context) ([]netifdInterface, error) {
+			reads.Add(1)
+			return nil, E.New("no ubus in tests")
+		}},
+	}
+	transport := &fallbackTestTransport{
+		TransportAdapter: TransportAdapter{transportType: "test", transportTag: "dns-server", fallback: state},
+		handler:          fallbackTestAnswers,
+	}
+	client := &Client{ctx: context.Background()}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type result struct {
+		response *mDNS.Msg
+		err      error
+	}
+	results := make(chan result, 4)
+	// the first query takes the decision, the second finds it taken, the third fails
+	for i, want := range []string{"server", "server", ""} {
+		var wantErr error
+		if want == "" {
+			transport.serve(fallbackTestFails)
+			wantErr = errFallbackTestServer
+		}
+		client.exchangeTransportAsync(ctx, transport, freshTestQuery(), func(response *mDNS.Msg, err error) {
+			results <- result{response, err}
+		})
+		select {
+		case answer := <-results:
+			if got, err := fallbackTestAnswer(answer.response, answer.err); got != want || err != wantErr {
+				t.Errorf("query %d: answered by %q (%v), want %q (%v)", i, got, err, want, wantErr)
+			}
+		case <-ctx.Done():
+			t.Fatalf("query %d: the callback was not called", i)
+		}
+		if !state.decided.Load() || state.eligible {
+			t.Fatalf("query %d: decided %v, want a server that does not qualify", i, state.decided.Load())
+		}
+	}
+	select {
+	case <-results:
+		t.Error("a callback was called twice")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if asked := transport.asked(); asked != 3 {
+		t.Errorf("server asked %d times, want 3", asked)
+	}
+	if reads.Load() != 0 {
+		t.Errorf("the provider's servers were read %d times for a server without the fallback", reads.Load())
 	}
 }
