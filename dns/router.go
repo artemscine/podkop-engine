@@ -1394,6 +1394,9 @@ func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
 func (r *Router) ResetNetwork() {
 	for _, transport := range r.transport.Transports() {
 		transport.Reset()
+		if state := fallbackFor(transport); state != nil {
+			state.reset()
+		}
 	}
 	ResetFallbackProviders() // the output device may have changed
 }
