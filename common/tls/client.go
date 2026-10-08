@@ -176,13 +176,37 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
 }
 
 func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
-	conn, err := d.dialer.DialContext(ctx, N.NetworkTCP, destination)
-	if err != nil {
-		return nil, err
+	var fallback fingerprintDial
+	if fallbackConfig, hasFallback := d.config.(fingerprintFallbackConfig); hasFallback {
+		fallback = fallbackConfig.fingerprintDial()
 	}
-	tlsConn, err := aTLS.ClientHandshake(ctx, conn, d.config)
-	if err != nil {
+	for {
+		conn, err := d.dialer.DialContext(ctx, N.NetworkTCP, destination)
+		if err != nil {
+			return nil, err
+		}
+		config := d.config
+		var watch *helloWatch
+		if fallback != nil {
+			config = fallback.attempt(conn)
+			watch = watchClientHello(conn)
+		}
+		tlsConn, err := aTLS.ClientHandshake(ctx, conn, config)
+		unanswered := watch.stop()
+		if err == nil {
+			if fallback != nil {
+				fallback.answered()
+			}
+			return withReadWait(tlsConn), nil
+		}
 		conn.Close()
+		if unanswered {
+			again, fallbackErr := fallback.unanswered(destination)
+			if again {
+				continue
+			}
+			return nil, fallbackErr
+		}
 		var echErr *tls.ECHRejectionError
 		if echRetry && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
 			if echConfig, isECH := d.config.(ECHCapableConfig); isECH {
@@ -192,7 +216,6 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
 		}
 		return nil, err
 	}
-	return withReadWait(tlsConn), nil
 }
 
 func (d *defaultDialer) Upstream() any {
