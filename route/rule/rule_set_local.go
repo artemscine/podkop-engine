@@ -31,6 +31,7 @@ type LocalRuleSet struct {
 	tag        string
 	access     sync.RWMutex
 	rules      []adapter.HeadlessRule
+	closed     bool
 	metadata   adapter.RuleSetMetadata
 	fileFormat string
 	watcher    *fswatch.Watcher
@@ -82,7 +83,22 @@ func (s *LocalRuleSet) Name() string {
 }
 
 func (s *LocalRuleSet) String() string {
-	return strings.Join(F.MapToString(s.rules), " ")
+	return strings.Join(F.MapToString(s.currentRules()), " ")
+}
+
+// currentRules reads the rules under the lock that reloadRules swaps them under: the file
+// watcher reloads a local set while connections match it.
+func (s *LocalRuleSet) currentRules() []adapter.HeadlessRule {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.rules
+}
+
+// dropRules forgets the rules, under the same lock.
+func (s *LocalRuleSet) dropRules() {
+	s.access.Lock()
+	s.rules = nil
+	s.access.Unlock()
 }
 
 func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
@@ -143,6 +159,11 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
 		return err
 	}
 	s.access.Lock()
+	if s.closed {
+		// a reload the watcher had already started when the set was closed
+		s.access.Unlock()
+		return nil
+	}
 	s.rules = rules
 	s.metadata = metadata
 	callbacks := s.callbacks.Array()
@@ -177,7 +198,7 @@ func (s *LocalRuleSet) DecRef() {
 
 func (s *LocalRuleSet) Cleanup() {
 	if s.refs.Load() == 0 {
-		s.rules = nil
+		s.dropRules()
 	}
 }
 
@@ -194,14 +215,18 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
 }
 
 func (s *LocalRuleSet) Close() error {
+	err := common.Close(common.PtrOrNil(s.watcher))
+	s.access.Lock()
+	s.closed = true
 	s.rules = nil
-	return common.Close(common.PtrOrNil(s.watcher))
+	s.access.Unlock()
+	return err
 }
 
 func (s *LocalRuleSet) Match(metadata *adapter.InboundContext) bool {
-	return matchAnyHeadlessRule(s.rules, metadata)
+	return matchAnyHeadlessRule(s.currentRules(), metadata)
 }
 
 func (s *LocalRuleSet) mergeableRule() *DefaultHeadlessRule {
-	return mergeableRuleIn(s.rules)
+	return mergeableRuleIn(s.currentRules())
 }
