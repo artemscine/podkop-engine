@@ -39,6 +39,8 @@ type UTLSClientConfig struct {
 	recordFragment        bool
 	spoof                 string
 	spoofMethod           tlsspoof.Method
+	// the fingerprint fallback, shared with the clones; nil when off
+	fallback *utlsFallback
 }
 
 func (c *UTLSClientConfig) ServerName() string {
@@ -115,6 +117,7 @@ func (c *UTLSClientConfig) Clone() Config {
 		recordFragment:        c.recordFragment,
 		spoof:                 c.spoof,
 		spoofMethod:           c.spoofMethod,
+		fallback:              c.fallback,
 	}
 	cloned.SetServerName(cloned.serverName)
 	return cloned
@@ -345,6 +348,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		recordFragment:        options.RecordFragment,
 		spoof:                 spoof,
 		spoofMethod:           spoofMethod,
+		fallback:              newUTLSFallback(logger, options.UTLS.Fingerprint, id, options.Reality != nil && options.Reality.Enabled, spoof != ""),
 	}
 	config.SetServerName(serverName)
 	if options.ECH != nil && options.ECH.Enabled {
