@@ -294,6 +294,7 @@ type URLTestGroup struct {
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
 	checking                     atomic.Bool
+	recheck                      atomic.Bool
 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
 	interruptGroup               *interrupt.Group
@@ -509,9 +510,19 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 // URLTestOutbounds).
 func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
 	if g.checking.Swap(true) {
+		if force {
+			// the round in progress began before whatever forced this one (a new default
+			// interface, mostly): its results are of the old state, so another follows it
+			g.recheck.Store(true)
+		}
 		return make(map[string]uint16), nil
 	}
-	defer g.checking.Store(false)
+	defer func() {
+		g.checking.Store(false)
+		if g.recheck.Swap(false) && g.ctx.Err() == nil && !g.networkPaused() {
+			go g.CheckOutbounds(g.ctx, true)
+		}
+	}()
 	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait), nil
 }
 
