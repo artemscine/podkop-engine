@@ -70,6 +70,7 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
 	chain := common.Map(metadata.OutboundChain, adapter.Outbound.Tag)
 	slices.Reverse(chain)
 	outbound := metadata.OutboundChain[len(metadata.OutboundChain)-1]
+	trimTrackedMetadata(&metadata)
 	return TrackerMetadata{
 		ID:           id,
 		Metadata:     metadata,
@@ -81,6 +82,17 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
 		Outbound:     outbound.Tag(),
 		OutboundType: outbound.Type(),
 	}
+}
+
+// trimTrackedMetadata drops from the tracker's copy what only routing needed: the sniffer's
+// working state (for QUIC, the fragments of the client hello collected so far) and the DNS
+// answers. A tracker lives as long as its connection, and then in the list of closed
+// connections.
+func trimTrackedMetadata(metadata *adapter.InboundContext) {
+	metadata.SniffContext = nil
+	metadata.SniffError = nil
+	metadata.DNSResponse = nil
+	metadata.NamedDNSResponses = nil
 }
 
 type connTracker struct {
