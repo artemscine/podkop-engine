@@ -178,12 +178,23 @@ func (s *URLTest) PerformUpdateCheck() {
 	s.group.requestUpdateCheck()
 }
 
+// NetworkReset is called at a reset of the network before the reset ends the dials in
+// flight (podkop-engine).
+func (s *URLTest) NetworkReset() {
+	if s.group != nil {
+		s.group.networkReset()
+	}
+}
+
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 	group := s.group
 	if group == nil {
 		return
 	}
-	if group.pause.IsDevicePaused() || group.pause.IsNetworkPaused() {
+	group.networkReset()
+	// asked of the group, not of the manager: the group tells a report of no network
+	// that the members have refuted (podkop-engine)
+	if group.networkPaused() {
 		return
 	}
 	go func() {
@@ -221,7 +232,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		}
 		var handshake *handshakeConn
 		if N.NeedHandshakeForWrite(conn) {
-			handshake = &handshakeConn{Conn: conn, failed: func(err error) { s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, time.Time{}) }}
+			handshake = &handshakeConn{Conn: conn, failed: func(err error) {
+				// a write that carries the connect is ended by a change of the network
+				// as a dial is
+				if !s.group.networkChangedSince(start) {
+					s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, time.Time{})
+				}
+			}}
 			conn = handshake
 		}
 		if N.NetworkName(network) == N.NetworkTCP {
@@ -288,6 +305,7 @@ type URLTestGroup struct {
 	history                      *urltest.HistoryStorage
 	checking                     atomic.Bool
 	recheck                      atomic.Bool
+	lastRound                    atomic.Int64 // when the last round began, since epoch
 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
 	interruptGroup               *interrupt.Group
@@ -305,10 +323,15 @@ type URLTestGroup struct {
 	epoch                        time.Time
 	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
 	localFailures                sync.Map // member tag → a failure of this host's own network waits to be judged
-	downloadLink                 string
-	frozen                       common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
-	responses                    sync.Map                                // member tag → *memberResponses
-	responsesClosed              atomic.Bool
+	// when the network last paused or woke, and when the pause in force was reported,
+	// since epoch (networkChangedSince, networkPaused)
+	networkEvent    atomic.Int64
+	networkPauseAt  atomic.Int64
+	networkCallback *list.Element[pause.Callback]
+	downloadLink    string
+	frozen          common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+	responses       sync.Map                                // member tag → *memberResponses
+	responsesClosed atomic.Bool
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -328,7 +351,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
-	return &URLTestGroup{
+	group := &URLTestGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
 		logger:                       logger,
@@ -346,7 +369,9 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		interruptExternalConnections: interruptExternalConnections,
 		epoch:                        time.Now(),
 		downloadLink:                 downloadLink,
-	}, nil
+	}
+	group.watchPause(group.pause)
+	return group, nil
 }
 
 func (g *URLTestGroup) PostStart() {
@@ -365,11 +390,13 @@ func (g *URLTestGroup) Touch() {
 	defer g.access.Unlock()
 	if g.ticker != nil {
 		g.lastActive.Store(time.Now())
+		g.probeUnseenNetwork()
 		return
 	}
 	ticker := time.NewTicker(g.interval)
 	g.ticker = ticker
 	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
+	g.keepTicking()
 	go g.loopCheck(ticker, g.close)
 }
 
@@ -377,6 +404,10 @@ func (g *URLTestGroup) Close() error {
 	g.responsesClosed.Store(true)
 	g.access.Lock()
 	defer g.access.Unlock()
+	if g.networkCallback != nil {
+		g.pause.UnregisterCallback(g.networkCallback)
+		g.networkCallback = nil
+	}
 	if g.ticker == nil {
 		return nil
 	}
@@ -481,6 +512,18 @@ func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{})
 	}
 }
 
+// requestRecheck asks for one more forced round after the one in progress: that one
+// began before whatever forced this one (a new default interface, mostly), and its
+// results are of the old state.
+func (g *URLTestGroup) requestRecheck() {
+	g.recheck.Store(true)
+	// that round may have ended, and looked at the flag, between the caller's look at it
+	// and the statement above: then this call is the only one left to act on the flag
+	if !g.checking.Load() && g.recheck.Swap(false) && g.ctx.Err() == nil && !g.networkPaused() {
+		go g.CheckOutbounds(g.ctx, true)
+	}
+}
+
 func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
 	_, _ = g.urlTest(ctx, force)
 }
@@ -505,14 +548,16 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) (map[string]uint16, error) {
 	if g.checking.Swap(true) {
 		if force {
-			// the round in progress began before whatever forced this one (a new default
-			// interface, mostly): its results are of the old state, so another follows it
-			g.recheck.Store(true)
+			g.requestRecheck()
 		}
 		return make(map[string]uint16), nil
 	}
+	g.lastRound.Store(int64(time.Since(g.epoch)))
 	defer func() {
 		g.checking.Store(false)
+		g.access.Lock()
+		g.keepTicking()
+		g.access.Unlock()
 		if g.recheck.Swap(false) && g.ctx.Err() == nil && !g.networkPaused() {
 			go g.CheckOutbounds(g.ctx, true)
 		}
