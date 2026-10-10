@@ -190,6 +190,20 @@ func (t *HTTPSTransport) resetTransportLocked() {
 func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	startAt := time.Now()
 	response, err := t.exchange(ctx, message)
+	if err != nil && errors.Is(err, io.ErrUnexpectedEOF) && ctx.Err() == nil {
+		// The server closed its HTTP/2 connection without a GOAWAY while this query was
+		// on it, as Quad9 does to busy connections too: x/net fails every query in
+		// flight there and asks none of them again. A DNS query may be asked again; the
+		// connection is gone, so this goes over a new one. Once: a server that closes the
+		// new connection as well is failing.
+		if t.logger != nil {
+			t.logger.DebugContext(ctx, "connection closed without a GOAWAY, query asked again")
+		}
+		// what follows compares this query with the others on its connection by when
+		// they began, and its connection is now the new one
+		startAt = time.Now()
+		response, err = t.exchange(ctx, message)
+	}
 	if !t.keepIdle.Load() {
 		t.CloseIdleConnections()
 	}
