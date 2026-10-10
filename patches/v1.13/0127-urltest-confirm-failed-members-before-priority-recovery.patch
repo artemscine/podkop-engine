@@ -1,4 +1,4 @@
-From 16a79820b7bbcff62714a5fca978a2cb8fe57120 Mon Sep 17 00:00:00 2001
+From 7fa04d1d92ddd3ecab98069ff18982be1a091dec Mon Sep 17 00:00:00 2001
 From: artemscine <artempemine@gmail.com>
 Date: Sat, 10 Oct 2026 23:00:15 +0300
 Subject: [PATCH] urltest: confirm failed members before priority recovery
@@ -6,12 +6,12 @@ Subject: [PATCH] urltest: confirm failed members before priority recovery
 ---
  cmd/sing-box/cmd_version.go                   |   1 +
  option/group.go                               |  22 ++-
- protocol/group/urltest.go                     |  51 ++++--
+ protocol/group/urltest.go                     |  51 +++--
  protocol/group/urltest_download.go            |   3 +
  protocol/group/urltest_failure.go             |   2 +
- protocol/group/urltest_fallback_recovery.go   | 100 +++++++++++
- .../group/urltest_fallback_recovery_test.go   | 156 ++++++++++++++++++
- 7 files changed, 316 insertions(+), 19 deletions(-)
+ protocol/group/urltest_fallback_recovery.go   | 100 ++++++++++
+ .../group/urltest_fallback_recovery_test.go   | 186 ++++++++++++++++++
+ 7 files changed, 346 insertions(+), 19 deletions(-)
  create mode 100644 protocol/group/urltest_fallback_recovery.go
  create mode 100644 protocol/group/urltest_fallback_recovery_test.go
 
@@ -57,7 +57,7 @@ index c3ffa88..78f7e02 100644
 +	MinHealthyTime *badoption.Duration `json:"min_healthy_time,omitempty"`
  }
 diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
-index 904ca61..61e360b 100644
+index 904ca61..9338222 100644
 --- a/protocol/group/urltest.go
 +++ b/protocol/group/urltest.go
 @@ -39,6 +39,7 @@ type URLTest struct {
@@ -165,7 +165,7 @@ index 904ca61..61e360b 100644
  			var testResult urlTestResult
 +			probeStarted := time.Now()
  			testResult.delay, testResult.err = testOutbound(g.ctx, g.link, p)
-+			if g.fallbackRecovery != nil && (g.ctx.Err() != nil || g.networkChangedSince(probeStarted) || (testResult.err != nil && g.networkPaused())) {
++			if g.fallbackRecovery != nil && (ctx.Err() != nil || g.ctx.Err() != nil || g.networkChangedSince(probeStarted) || (testResult.err != nil && g.networkPaused())) {
 +				return nil, nil
 +			}
 +			if g.fallbackRecovery != nil && testResult.err != nil && localNetworkError(testResult.err) {
@@ -330,14 +330,15 @@ index 0000000..aad0669
 +}
 diff --git a/protocol/group/urltest_fallback_recovery_test.go b/protocol/group/urltest_fallback_recovery_test.go
 new file mode 100644
-index 0000000..e2ed5a8
+index 0000000..9f5e77d
 --- /dev/null
 +++ b/protocol/group/urltest_fallback_recovery_test.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,186 @@
 +package group
 +
 +import (
 +	"context"
++	"net"
 +	"syscall"
 +	"testing"
 +	"time"
@@ -345,6 +346,7 @@ index 0000000..e2ed5a8
 +	"github.com/sagernet/sing-box/adapter"
 +	"github.com/sagernet/sing-box/option"
 +	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
 +	N "github.com/sagernet/sing/common/network"
 +)
 +
@@ -488,6 +490,34 @@ index 0000000..e2ed5a8
 +	g.CheckOutbounds(true)
 +	if g.fallbackRecovered("a") {
 +		t.Fatal("failed periodic probe did not start recovery")
++	}
++}
++
++func TestFallbackRecoveryIgnoresCancelledManualProbe(t *testing.T) {
++	for _, responds := range []bool{true, false} {
++		t.Run(map[bool]string{true: "success", false: "failure"}[responds], func(t *testing.T) {
++			link, _ := testURL(t, 0)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			a := newTestMember("vless", "a", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++				cancel()
++				if responds {
++					return dialWorking(ctx, network, destination)
++				}
++				return dialRefused(ctx, network, destination)
++			})
++			b := newTestMember("vless", "b", dialWorking)
++			_, g := newTestFallbackGroup(t, link, "", members(a), members(b), map[string]uint16{"a": 10, "b": 20})
++			g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{})
++			g.fallbackRecovery.failed("a")
++			before := g.fallbackRecovery.members["a"].failuresAt
++			history := g.history.LoadURLTestHistory("a")
++			_, _ = g.urlTestRound(ctx, true)
++			member := g.fallbackRecovery.members["a"]
++			if member.successes != 0 || !member.failuresAt.Equal(before) || g.history.LoadURLTestHistory("a") != history {
++				t.Fatal("cancelled manual probe changed recovery or history")
++			}
++		})
 +	}
 +}
 -- 
