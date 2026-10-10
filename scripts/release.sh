@@ -8,6 +8,7 @@
 set -eu
 DIST=${1:?dir with packages}; shift
 . ./versions.env
+. ./fork.env
 [ $# -gt 0 ] || set -- $LINES
 newest=$(echo $LINES | tr ' ' '\n' | sort -V | tail -1)
 repo=${GH_REPO:?GH_REPO=owner/repo}

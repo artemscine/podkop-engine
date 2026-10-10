@@ -6,14 +6,14 @@ on:
     inputs:
       lines:
         description: "Ветки sing-box (через пробел)"
-        default: "1.12 1.13 1.14"
+        default: "1.13"
       format:
         description: "Формат пакетов"
         type: choice
         options: [all, ipk, apk]
         default: all
       only:
-        description: "Только эти pkgarch через запятую (пусто = все), например x86_64,mipsel_24kc"
+        description: "Архитектуры через запятую (пусто = обе): aarch64_cortex-a53,x86_64"
         default: ""
       release:
         description: "Создать черновик релиза"

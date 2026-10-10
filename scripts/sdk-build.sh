@@ -20,6 +20,7 @@ SRC=${SRC:-/src}
 OUT=${OUT:-/out}
 
 . "$SRC/versions.env"
+. "$SRC/fork.env"
 
 log() { printf '\n=== %s\n' "$*"; }
 

@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 DL = "https://downloads.openwrt.org"
 HUB = "https://hub.docker.com/v2/repositories/openwrt/sdk/tags/"
+SUPPORTED_ARCHES = frozenset({"aarch64_cortex-a53", "x86_64"})
 
 
 def load_env(path):
@@ -125,17 +126,19 @@ def main():
     ap.add_argument("--only", help="comma-separated pkgarch filter (for test runs)")
     args = ap.parse_args()
     env = load_env(args.env)
-    only = set(args.only.split(",")) if args.only else None
+    only = set(args.only.split(",")) if args.only else SUPPORTED_ARCHES
+    if only - SUPPORTED_ARCHES:
+        ap.error("unsupported pkgarch: " + ",".join(sorted(only - SUPPORTED_ARCHES)))
 
     matrix = []
     if args.format in ("ipk", "all"):
         rel = env["SDK_IPK_RELEASE"]
         arches = singbox_arches(rel)
-        matrix += [dict(r, format="ipk") for r in pick(rel, arches & only if only else arches)]
+        matrix += [dict(r, format="ipk") for r in pick(rel, arches & only)]
     if args.format in ("apk", "all"):
         rel = env["SDK_APK_RELEASE"]
         arches = singbox_arches(rel)
-        matrix += [dict(r, format="apk") for r in pick(rel, arches & only if only else arches)]
+        matrix += [dict(r, format="apk") for r in pick(rel, arches & only)]
     json.dump({"include": matrix}, sys.stdout, indent=1)
     print(f"{len(matrix)} jobs", file=sys.stderr)
 
