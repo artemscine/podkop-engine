@@ -109,6 +109,7 @@ EOF
   [ -n "$full" ] && echo 'CONFIG_PACKAGE_podkop-engine-full=m' >> .config
   make defconfig >/dev/null 2>&1
   pkgarch=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' .config)
+  case "$pkgarch" in aarch64_cortex-a53|x86_64) ;; *) echo "unsupported pkgarch: $pkgarch" >&2; status=1; continue;; esac
   naive=; [ -n "$full" ] && grep -qx "$pkgarch" package/podkop-engine/naive.pkgarchs && naive=1
   [ -n "$naive" ] && fetch_lld
   rm -rf bin/packages

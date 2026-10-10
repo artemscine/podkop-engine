@@ -3,6 +3,7 @@
 set -euo pipefail
 project=$(cd "$(dirname "$0")/.." && pwd)
 source "$project/versions.env"
+[[ "$(go version | awk '{print $3}')" == "go$GO_VERSION" ]] || { echo "Pinned Go $GO_VERSION required" >&2; exit 1; }
 architecture=${1:?Usage: build-package.sh x86_64|aarch64_cortex-a53 OUTPUT}
 output=${2:?Output directory required}
 case "$architecture" in x86_64) goarch=amd64;; aarch64_cortex-a53) goarch=arm64;; *) exit 2;; esac
