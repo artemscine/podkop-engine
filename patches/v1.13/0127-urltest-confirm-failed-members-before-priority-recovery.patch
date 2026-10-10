@@ -1,0 +1,495 @@
+From 16a79820b7bbcff62714a5fca978a2cb8fe57120 Mon Sep 17 00:00:00 2001
+From: artemscine <artempemine@gmail.com>
+Date: Sat, 10 Oct 2026 23:00:15 +0300
+Subject: [PATCH] urltest: confirm failed members before priority recovery
+
+---
+ cmd/sing-box/cmd_version.go                   |   1 +
+ option/group.go                               |  22 ++-
+ protocol/group/urltest.go                     |  51 ++++--
+ protocol/group/urltest_download.go            |   3 +
+ protocol/group/urltest_failure.go             |   2 +
+ protocol/group/urltest_fallback_recovery.go   | 100 +++++++++++
+ .../group/urltest_fallback_recovery_test.go   | 156 ++++++++++++++++++
+ 7 files changed, 316 insertions(+), 19 deletions(-)
+ create mode 100644 protocol/group/urltest_fallback_recovery.go
+ create mode 100644 protocol/group/urltest_fallback_recovery_test.go
+
+diff --git a/cmd/sing-box/cmd_version.go b/cmd/sing-box/cmd_version.go
+index b8ac1e4..181f1df 100644
+--- a/cmd/sing-box/cmd_version.go
++++ b/cmd/sing-box/cmd_version.go
+@@ -81,4 +81,5 @@ var versionFeatures = []string{
+ 	"tools.decode-link",
+ 	// the uTLS fingerprint fallback (SING_BOX_UTLS_FALLBACK)
+ 	"tls.utls-fallback",
++	"urltest.fallback_recovery",
+ }
+diff --git a/option/group.go b/option/group.go
+index c3ffa88..78f7e02 100644
+--- a/option/group.go
++++ b/option/group.go
+@@ -9,12 +9,18 @@ type SelectorOutboundOptions struct {
+ }
+ 
+ type URLTestOutboundOptions struct {
+-	Outbounds                 []string           `json:"outbounds"`
+-	Fallbacks                 []string           `json:"fallbacks,omitempty"`
+-	URL                       string             `json:"url,omitempty"`
+-	DownloadURL               *string            `json:"download_url,omitempty"`
+-	Interval                  badoption.Duration `json:"interval,omitempty"`
+-	Tolerance                 uint16             `json:"tolerance,omitempty"`
+-	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
+-	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
++	FallbackRecovery          *URLTestFallbackRecoveryOptions `json:"fallback_recovery,omitempty"`
++	Outbounds                 []string                        `json:"outbounds"`
++	Fallbacks                 []string                        `json:"fallbacks,omitempty"`
++	URL                       string                          `json:"url,omitempty"`
++	DownloadURL               *string                         `json:"download_url,omitempty"`
++	Interval                  badoption.Duration              `json:"interval,omitempty"`
++	Tolerance                 uint16                          `json:"tolerance,omitempty"`
++	IdleTimeout               badoption.Duration              `json:"idle_timeout,omitempty"`
++	InterruptExistConnections bool                            `json:"interrupt_exist_connections,omitempty"`
++}
++
++type URLTestFallbackRecoveryOptions struct {
++	Successes      int                 `json:"successes,omitempty"`
++	MinHealthyTime *badoption.Duration `json:"min_healthy_time,omitempty"`
+ }
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 904ca61..61e360b 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -39,6 +39,7 @@ type URLTest struct {
+ 	connection                   adapter.ConnectionManager
+ 	logger                       log.ContextLogger
+ 	tags                         []string
++	recoveryOptions              *option.URLTestFallbackRecoveryOptions
+ 	fallbackTags                 []string
+ 	all                          []string
+ 	link                         string
+@@ -51,6 +52,9 @@ type URLTest struct {
+ }
+ 
+ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
++	if err := validateFallbackRecovery(options); err != nil {
++		return nil, err
++	}
+ 	// a new slice: appending to the decoded options could write into their array
+ 	all := slices.Concat(options.Outbounds, options.Fallbacks)
+ 	outbound := &URLTest{
+@@ -61,6 +65,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		logger:                       logger,
+ 		tags:                         options.Outbounds,
+ 		fallbackTags:                 options.Fallbacks,
++		recoveryOptions:              options.FallbackRecovery,
+ 		all:                          all,
+ 		link:                         options.URL,
+ 		interval:                     time.Duration(options.Interval),
+@@ -119,6 +124,7 @@ func (s *URLTest) Start() error {
+ 	if err != nil {
+ 		return err
+ 	}
++	group.fallbackRecovery = newFallbackRecovery(s.recoveryOptions)
+ 	s.group = group
+ 	return nil
+ }
+@@ -315,13 +321,14 @@ type URLTestGroup struct {
+ 	localFailures                sync.Map // member tag → a failure of this host's own network waits to be judged
+ 	// when the network last paused or woke, and when the pause in force was reported,
+ 	// since epoch (networkChangedSince, networkPaused)
+-	networkEvent    atomic.Int64
+-	networkPauseAt  atomic.Int64
+-	networkCallback *list.Element[pause.Callback]
+-	downloadLink    string
+-	frozen          common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+-	responses       sync.Map                                // member tag → *memberResponses
+-	responsesClosed atomic.Bool
++	networkEvent     atomic.Int64
++	networkPauseAt   atomic.Int64
++	networkCallback  *list.Element[pause.Callback]
++	fallbackRecovery *fallbackRecovery
++	downloadLink     string
++	frozen           common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
++	responses        sync.Map                                // member tag → *memberResponses
++	responsesClosed  atomic.Bool
+ }
+ 
+ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+@@ -421,6 +428,15 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+ // outbounds is chosen, by the tolerance; only when none of them is a candidate, the first
+ // fallback that is, in the order of the list.
+ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history *adapter.URLTestHistory) bool) (adapter.Outbound, bool) {
++	chosen, alive := g.selectRecoveryAmong(network, skip, true)
++	if alive || g.fallbackRecovery == nil {
++		return chosen, alive
++	}
++	// When all confirmed paths are unavailable, a responding recovering member remains usable.
++	return g.selectRecoveryAmong(network, skip, false)
++}
++
++func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string, history *adapter.URLTestHistory) bool, confirmed bool) (adapter.Outbound, bool) {
+ 	var minDelay uint16
+ 	var minOutbound adapter.Outbound
+ 	var selected adapter.Outbound
+@@ -433,7 +449,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 	// a fallback in use holds back no outbound: it is chosen only while none is a candidate
+ 	if selected != nil && !g.isFallback(selected) {
+ 		tag := RealTag(selected)
+-		if history := g.history.LoadURLTestHistory(tag); history != nil && (skip == nil || !skip(tag, history)) {
++		if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
+ 			minOutbound = selected
+ 			minDelay = history.Delay
+ 		}
+@@ -444,7 +460,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 		}
+ 		tag := RealTag(detour)
+ 		history := g.history.LoadURLTestHistory(tag)
+-		if history == nil || (skip != nil && skip(tag, history)) {
++		if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
+ 			continue
+ 		}
+ 		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
+@@ -459,7 +475,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
+ 			}
+ 			tag := RealTag(detour)
+ 			history := g.history.LoadURLTestHistory(tag)
+-			if history == nil || (skip != nil && skip(tag, history)) {
++			if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
+ 				continue
+ 			}
+ 			return detour, true
+@@ -584,14 +600,27 @@ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool) (map[string
+ 		}
+ 		b.Go(realTag, func() (any, error) {
+ 			var testResult urlTestResult
++			probeStarted := time.Now()
+ 			testResult.delay, testResult.err = testOutbound(g.ctx, g.link, p)
++			if g.fallbackRecovery != nil && (g.ctx.Err() != nil || g.networkChangedSince(probeStarted) || (testResult.err != nil && g.networkPaused())) {
++				return nil, nil
++			}
++			if g.fallbackRecovery != nil && testResult.err != nil && localNetworkError(testResult.err) {
++				g.afterLocalFailure(realTag, func() { g.history.DeleteURLTestHistory(realTag); g.recoveryFailed(realTag); g.requestUpdateCheck() })
++				return nil, nil
++			}
+ 			if testResult.err != nil {
+ 				g.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
+ 				g.history.DeleteURLTestHistory(realTag)
++				g.recoveryFailed(realTag)
+ 			} else {
+ 				g.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
++				answeredAt := time.Now()
++				if g.fallbackRecovery != nil {
++					g.fallbackRecovery.answered(realTag, answeredAt, g.interval)
++				}
+ 				g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+-					Time:  time.Now(),
++					Time:  answeredAt,
+ 					Delay: testResult.delay,
+ 				})
+ 				resultAccess.Lock()
+diff --git a/protocol/group/urltest_download.go b/protocol/group/urltest_download.go
+index 23512b0..09a2a43 100644
+--- a/protocol/group/urltest_download.go
++++ b/protocol/group/urltest_download.go
+@@ -103,6 +103,9 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
+ 		// ran (the round forced by a network change, which also cut this download) is a
+ 		// newer result and brings the member back
+ 		g.setFrozen(tag, start)
++		if !g.networkPaused() && !g.networkChangedSince(start) {
++			g.recoveryFailed(tag)
++		}
+ 		tried[tag] = true
+ 	}
+ 	if current != nil && g.history.LoadURLTestHistory(RealTag(current)) != nil {
+diff --git a/protocol/group/urltest_failure.go b/protocol/group/urltest_failure.go
+index b3c2ba9..85a7f89 100644
+--- a/protocol/group/urltest_failure.go
++++ b/protocol/group/urltest_failure.go
+@@ -113,6 +113,7 @@ func (g *URLTestGroup) judgeFailure(tag string, member adapter.Outbound, network
+ 		}
+ 		g.logger.Info("outbound ", tag, " unavailable: ", err)
+ 		g.history.DeleteURLTestHistory(tag)
++		g.recoveryFailed(tag)
+ 	}
+ 	g.requestUpdateCheck()
+ }
+@@ -355,6 +356,7 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
+ 		unavailable := func() {
+ 			g.logger.Info("outbound ", tag, " unavailable: ", err)
+ 			g.history.DeleteURLTestHistory(tag)
++			g.recoveryFailed(tag)
+ 			g.performUpdateCheck()
+ 		}
+ 		if localNetworkError(err) {
+diff --git a/protocol/group/urltest_fallback_recovery.go b/protocol/group/urltest_fallback_recovery.go
+new file mode 100644
+index 0000000..aad0669
+--- /dev/null
++++ b/protocol/group/urltest_fallback_recovery.go
+@@ -0,0 +1,100 @@
++package group
++
++// Optional fallback recovery — optional recovery confirmation. Selection and ordering
++// remain the author's policy; this only delays re-admission of failed members.
++
++import (
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"sync"
++	"time"
++)
++
++type fallbackRecovery struct {
++	access    sync.Mutex
++	successes int
++	delay     time.Duration
++	members   map[string]*fallbackRecoveryMember
++}
++
++type fallbackRecoveryMember struct {
++	failuresAt  time.Time
++	firstAnswer time.Time
++	countedAt   time.Time
++	observedAt  time.Time
++	successes   int
++}
++
++func validateFallbackRecovery(options option.URLTestOutboundOptions) error {
++	r := options.FallbackRecovery
++	if r == nil {
++		return nil
++	}
++	if len(options.Fallbacks) == 0 {
++		return E.New("urltest: fallback_recovery requires fallbacks")
++	}
++	if r.Successes < 0 || r.Successes > 100 {
++		return E.New("urltest: fallback_recovery.successes must be 1..100 (0 uses 3)")
++	}
++	if r.MinHealthyTime != nil && (time.Duration(*r.MinHealthyTime) < 0 || time.Duration(*r.MinHealthyTime) > 24*time.Hour) {
++		return E.New("urltest: fallback_recovery.min_healthy_time must be 0..24h")
++	}
++	return nil
++}
++
++func newFallbackRecovery(options *option.URLTestFallbackRecoveryOptions) *fallbackRecovery {
++	if options == nil {
++		return nil
++	}
++	successes := options.Successes
++	if successes == 0 {
++		successes = 3
++	}
++	delay := time.Minute
++	if options.MinHealthyTime != nil {
++		delay = time.Duration(*options.MinHealthyTime)
++	}
++	return &fallbackRecovery{successes: successes, delay: delay, members: make(map[string]*fallbackRecoveryMember)}
++}
++
++func (r *fallbackRecovery) failed(tag string) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	r.members[tag] = &fallbackRecoveryMember{failuresAt: time.Now()}
++}
++
++func (r *fallbackRecovery) answered(tag string, at time.Time, interval time.Duration) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	member := r.members[tag]
++	if member == nil || !at.After(member.failuresAt) || !at.After(member.observedAt) {
++		return
++	}
++	member.observedAt = at
++	if member.firstAnswer.IsZero() {
++		member.firstAnswer = at
++	}
++	// Manual tests and dashboard refreshes cannot manufacture consecutive scheduled
++	// successes. Count at most one success per group interval, using proof timestamps.
++	if member.countedAt.IsZero() || at.Sub(member.countedAt) >= interval {
++		member.countedAt = at
++		member.successes++
++	}
++}
++
++func (r *fallbackRecovery) recovered(tag string, now time.Time) bool {
++	r.access.Lock()
++	defer r.access.Unlock()
++	member := r.members[tag]
++	return member == nil || (member.successes >= r.successes && !member.firstAnswer.IsZero() && now.Sub(member.firstAnswer) >= r.delay && member.observedAt.Sub(member.firstAnswer) >= r.delay)
++}
++
++func (g *URLTestGroup) fallbackRecovered(tag string) bool {
++	return g.fallbackRecovery == nil || g.fallbackRecovery.recovered(tag, time.Now())
++}
++
++func (g *URLTestGroup) recoveryFailed(tag string) {
++	if g.fallbackRecovery != nil {
++		g.fallbackRecovery.failed(tag)
++	}
++}
+diff --git a/protocol/group/urltest_fallback_recovery_test.go b/protocol/group/urltest_fallback_recovery_test.go
+new file mode 100644
+index 0000000..e2ed5a8
+--- /dev/null
++++ b/protocol/group/urltest_fallback_recovery_test.go
+@@ -0,0 +1,156 @@
++package group
++
++import (
++	"context"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	N "github.com/sagernet/sing/common/network"
++)
++
++func TestFallbackRecoveryConfirmationAndReset(t *testing.T) {
++	delay := badoption.Duration(time.Minute)
++	r := newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{Successes: 3, MinHealthyTime: &delay})
++	base := time.Now().Add(-5 * time.Minute)
++	r.members["a"] = &fallbackRecoveryMember{failuresAt: base}
++	r.answered("a", base.Add(time.Second), 30*time.Second)
++	if r.recovered("a", base.Add(time.Minute)) {
++		t.Fatal("one answer is not recovery")
++	}
++	// Repeated manual tests are not independent scheduled successes.
++	for i := 2; i < 20; i++ {
++		r.answered("a", base.Add(time.Duration(i)*time.Second), 30*time.Second)
++	}
++	if r.recovered("a", base.Add(2*time.Minute)) {
++		t.Fatal("manual probe burst bypassed confirmation")
++	}
++	r.answered("a", base.Add(31*time.Second), 30*time.Second)
++	r.answered("a", base.Add(61*time.Second), 30*time.Second)
++	if !r.recovered("a", base.Add(61*time.Second)) {
++		t.Fatal("stable recovery was not admitted")
++	}
++	r.failed("a")
++	r.answered("a", base.Add(91*time.Second), 30*time.Second) // stale proof from before failure
++	if r.recovered("a", time.Now().Add(time.Hour)) {
++		t.Fatal("time or stale history erased a new failure")
++	}
++	if !r.recovered("never-failed", time.Now()) {
++		t.Fatal("healthy cold start must not wait")
++	}
++}
++
++func TestFallbackRecoveryHoldsReserveUntilStable(t *testing.T) {
++	g, nodes := fallbackFixture(t)
++	delay := badoption.Duration(time.Minute)
++	g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{Successes: 3, MinHealthyTime: &delay})
++	g.history.DeleteURLTestHistory(nodes[0].Tag())
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, nodes[1])
++	base := time.Now().Add(-3 * time.Minute)
++	g.fallbackRecovery.members[nodes[0].Tag()] = &fallbackRecoveryMember{failuresAt: base}
++	for index := 0; index < 3; index++ {
++		at := base.Add(time.Second + time.Duration(index)*30*time.Second)
++		g.history.StoreURLTestHistory(nodes[0].Tag(), &adapter.URLTestHistory{Time: at, Delay: 1})
++		g.fallbackRecovery.answered(nodes[0].Tag(), at, 30*time.Second)
++		g.performUpdateCheck()
++		want := nodes[1]
++		if index == 2 {
++			want = nodes[0]
++		}
++		assertSelected(t, g, N.NetworkTCP, want)
++	}
++}
++
++func TestFallbackRecoveryDoesNotStrandAllDownGroup(t *testing.T) {
++	g, nodes := fallbackFixture(t)
++	g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{})
++	g.fallbackRecovery.failed(nodes[0].Tag())
++	g.history.DeleteURLTestHistory(nodes[1].Tag())
++	g.history.DeleteURLTestHistory(nodes[2].Tag())
++	chosen, alive := g.Select(N.NetworkTCP)
++	if !alive || chosen != nodes[0] {
++		t.Fatal("only responding path must remain usable")
++	}
++}
++
++func TestFallbackRecoveryConfiguration(t *testing.T) {
++	negative := badoption.Duration(-time.Second)
++	for _, options := range []option.URLTestOutboundOptions{
++		{Outbounds: []string{"a"}, FallbackRecovery: &option.URLTestFallbackRecoveryOptions{}},
++		{Outbounds: []string{"a"}, Fallbacks: []string{"b"}, FallbackRecovery: &option.URLTestFallbackRecoveryOptions{Successes: -1}},
++		{Outbounds: []string{"a"}, Fallbacks: []string{"b"}, FallbackRecovery: &option.URLTestFallbackRecoveryOptions{MinHealthyTime: &negative}},
++	} {
++		if validateFallbackRecovery(options) == nil {
++			t.Fatal("invalid confirmation settings accepted")
++		}
++	}
++	if newFallbackRecovery(nil) != nil {
++		t.Fatal("confirmation must be opt-in")
++	}
++}
++
++func TestFallbackRecoveryNeedsProofAcrossHealthyWindow(t *testing.T) {
++	delay := badoption.Duration(time.Minute)
++	r := newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{Successes: 1, MinHealthyTime: &delay})
++	base := time.Now().Add(-5 * time.Minute)
++	r.members["a"] = &fallbackRecoveryMember{failuresAt: base}
++	r.answered("a", base.Add(time.Second), time.Second)
++	if r.recovered("a", time.Now()) {
++		t.Fatal("elapsed time without another proof is not continuous recovery")
++	}
++	r.answered("a", base.Add(61*time.Second), time.Second)
++	if !r.recovered("a", time.Now()) {
++		t.Fatal("proof spanning the healthy window was not admitted")
++	}
++}
++
++func fallbackFixture(t *testing.T) (*URLTestGroup, []*testMember) {
++	a := newTestMember("vless", "a", dialWorking)
++	b := newTestMember("vless", "b", dialWorking)
++	c := newTestMember("vless", "c", dialWorking)
++	_, g := newTestFallbackGroup(t, "", "", members(a), members(b, c), map[string]uint16{"a": 10, "b": 20, "c": 30})
++	return g, []*testMember{a, b, c}
++}
++func assertSelected(t *testing.T, g *URLTestGroup, network string, want adapter.Outbound) {
++	t.Helper()
++	selected := g.selectedOutboundTCP.Load()
++	if network == N.NetworkUDP {
++		selected = g.selectedOutboundUDP.Load()
++	}
++	if selected != want {
++		t.Fatalf("selected %v, want %v", selected, want)
++	}
++}
++
++func TestFallbackRecoveryIgnoresCanceledAndNetworkResetFailures(t *testing.T) {
++	g, nodes := fallbackFixture(t)
++	g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{})
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	g.memberFailed(ctx, nodes[0], N.NetworkTCP, syscall.ECONNREFUSED, time.Now())
++	if len(g.fallbackRecovery.members) != 0 {
++		t.Fatal("caller cancellation changed recovery")
++	}
++	start := time.Now()
++	g.networkReset()
++	g.memberFailed(context.Background(), nodes[0], N.NetworkTCP, syscall.ECONNREFUSED, start)
++	if len(g.fallbackRecovery.members) != 0 {
++		t.Fatal("failure across network reset changed recovery")
++	}
++}
++
++func TestFallbackRecoveryRejectedProbeResetsProof(t *testing.T) {
++	link, _ := testURL(t, 0)
++	a := newTestMember("vless", "a", dialRefused)
++	b := newTestMember("vless", "b", dialWorking)
++	_, g := newTestFallbackGroup(t, link, "", members(a), members(b), map[string]uint16{"a": 10, "b": 20})
++	g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{})
++	g.CheckOutbounds(true)
++	if g.fallbackRecovered("a") {
++		t.Fatal("failed periodic probe did not start recovery")
++	}
++}
+-- 
+2.56.0
+
