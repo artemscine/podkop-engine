@@ -138,4 +138,3 @@ endef
 Package/podkop-engine-full/install=$(Package/podkop-engine/install)
 
 $(eval $(call BuildPackage,podkop-engine))
-$(eval $(call BuildPackage,podkop-engine-full))

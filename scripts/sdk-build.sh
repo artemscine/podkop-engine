@@ -105,8 +105,7 @@ EOF
   rm -f .config
   make defconfig >/dev/null 2>&1
   echo 'CONFIG_PACKAGE_podkop-engine=m' >> .config
-  full=; grep -qs podkop_full "$SRC/patches/v$LINE"/*.patch && full=1
-  [ -n "$full" ] && echo 'CONFIG_PACKAGE_podkop-engine-full=m' >> .config
+  full=
   make defconfig >/dev/null 2>&1
   pkgarch=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' .config)
   case "$pkgarch" in aarch64_cortex-a53|x86_64) ;; *) echo "unsupported pkgarch: $pkgarch" >&2; status=1; continue;; esac
