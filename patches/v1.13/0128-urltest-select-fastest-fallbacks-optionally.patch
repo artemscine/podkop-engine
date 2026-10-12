@@ -1,0 +1,197 @@
+diff --git a/cmd/sing-box/cmd_version.go b/cmd/sing-box/cmd_version.go
+index 181f1df..a055e0a 100644
+--- a/cmd/sing-box/cmd_version.go
++++ b/cmd/sing-box/cmd_version.go
+@@ -82,4 +82,5 @@ var versionFeatures = []string{
+ 	// the uTLS fingerprint fallback (SING_BOX_UTLS_FALLBACK)
+ 	"tls.utls-fallback",
+ 	"urltest.fallback_recovery",
++	"urltest.fallback_selection",
+ }
+diff --git a/docs/configuration/outbound/urltest.md b/docs/configuration/outbound/urltest.md
+index 13b107e..8fee1f0 100644
+--- a/docs/configuration/outbound/urltest.md
++++ b/docs/configuration/outbound/urltest.md
+@@ -46,6 +46,14 @@ before the group switches to it, as an outbound does.
+ 
+ A fallback may not repeat a tag of `outbounds` or of `fallbacks`.
+ 
++#### fallback_selection
++
++Optional selection policy for `fallbacks`: `ordered` (the default) or `fastest`.
++With `fastest`, available fallbacks compete by delay using the group's tolerance;
++the current fallback stays within that tolerance. Available `outbounds` always
++take precedence. Failure, download checks and optional recovery confirmation
++apply to both policies. Omitting the option preserves ordered selection.
++
+ #### url
+ 
+ The URL to test. `https://www.gstatic.com/generate_204` will be used if empty.
+diff --git a/option/group.go b/option/group.go
+index 78f7e02..246761a 100644
+--- a/option/group.go
++++ b/option/group.go
+@@ -12,6 +12,7 @@ type URLTestOutboundOptions struct {
+ 	FallbackRecovery          *URLTestFallbackRecoveryOptions `json:"fallback_recovery,omitempty"`
+ 	Outbounds                 []string                        `json:"outbounds"`
+ 	Fallbacks                 []string                        `json:"fallbacks,omitempty"`
++	FallbackSelection         string                          `json:"fallback_selection,omitempty"`
+ 	URL                       string                          `json:"url,omitempty"`
+ 	DownloadURL               *string                         `json:"download_url,omitempty"`
+ 	Interval                  badoption.Duration              `json:"interval,omitempty"`
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index 9338222..77da67e 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -40,6 +40,7 @@ type URLTest struct {
+ 	logger                       log.ContextLogger
+ 	tags                         []string
+ 	recoveryOptions              *option.URLTestFallbackRecoveryOptions
++	fallbackFastest              bool
+ 	fallbackTags                 []string
+ 	all                          []string
+ 	link                         string
+@@ -52,6 +53,9 @@ type URLTest struct {
+ }
+ 
+ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
++	if options.FallbackSelection != "" && options.FallbackSelection != "ordered" && options.FallbackSelection != "fastest" {
++		return nil, E.New("unknown fallback_selection: ", options.FallbackSelection)
++	}
+ 	if err := validateFallbackRecovery(options); err != nil {
+ 		return nil, err
+ 	}
+@@ -66,6 +70,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		tags:                         options.Outbounds,
+ 		fallbackTags:                 options.Fallbacks,
+ 		recoveryOptions:              options.FallbackRecovery,
++		fallbackFastest:              options.FallbackSelection == "fastest",
+ 		all:                          all,
+ 		link:                         options.URL,
+ 		interval:                     time.Duration(options.Interval),
+@@ -125,6 +130,7 @@ func (s *URLTest) Start() error {
+ 		return err
+ 	}
+ 	group.fallbackRecovery = newFallbackRecovery(s.recoveryOptions)
++	group.fallbackFastest = s.fallbackFastest
+ 	s.group = group
+ 	return nil
+ }
+@@ -325,6 +331,7 @@ type URLTestGroup struct {
+ 	networkPauseAt   atomic.Int64
+ 	networkCallback  *list.Element[pause.Callback]
+ 	fallbackRecovery *fallbackRecovery
++	fallbackFastest  bool
+ 	downloadLink     string
+ 	frozen           common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+ 	responses        sync.Map                                // member tag → *memberResponses
+@@ -469,6 +476,12 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
+ 		}
+ 	}
+ 	if minOutbound == nil {
++		if g.fallbackFastest && selected != nil && g.isFallback(selected) && common.Contains(selected.Network(), network) {
++			tag := RealTag(selected)
++			if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
++				minOutbound, minDelay = selected, history.Delay
++			}
++		}
+ 		for _, detour := range g.fallbacks {
+ 			if !common.Contains(detour.Network(), network) {
+ 				continue
+@@ -478,7 +491,15 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
+ 			if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
+ 				continue
+ 			}
+-			return detour, true
++			if !g.fallbackFastest {
++				return detour, true
++			}
++			if minOutbound == nil || uint32(minDelay) > uint32(history.Delay)+uint32(g.tolerance) {
++				minOutbound, minDelay = detour, history.Delay
++			}
++		}
++		if minOutbound != nil {
++			return minOutbound, true
+ 		}
+ 		// the plain choice: the first outbound for the network, or, without one, fallback
+ 		for _, detour := range g.members {
+diff --git a/protocol/group/urltest_fallback_selection_test.go b/protocol/group/urltest_fallback_selection_test.go
+new file mode 100644
+index 0000000..dd46b20
+--- /dev/null
++++ b/protocol/group/urltest_fallback_selection_test.go
+@@ -0,0 +1,74 @@
++package group
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/stretchr/testify/require"
++)
++
++func TestFallbackSelectionFastestAndTolerance(t *testing.T) {
++	link, _ := testURL(t, 0)
++	a := newTestMember(C.TypeVLESS, "a", dialWorking)
++	f1 := newTestMember(C.TypeVLESS, "f1", dialWorking)
++	f2 := newTestMember(C.TypeVLESS, "f2", dialWorking)
++	_, g := newTestFallbackGroup(t, link, "", members(a), members(f1, f2), map[string]uint16{"a": 900, "f1": 300, "f2": 100})
++	g.fallbackFastest = true
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, a)
++	setResult(g, "a", 0)
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, f2)
++	assertSelected(t, g, N.NetworkUDP, f2)
++	setResult(g, "f1", 70) // within the existing 50 ms tolerance
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, f2)
++	setResult(g, "f1", 40)
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, f1)
++	setResult(g, "f1", 0)
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, f2)
++	setResult(g, "a", 900)
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, a)
++}
++
++func TestFallbackSelectionRecoveryAndFrozen(t *testing.T) {
++	g, nodes := fallbackFixture(t)
++	g.fallbackFastest = true
++	delay := badoption.Duration(time.Minute)
++	g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{Successes: 3, MinHealthyTime: &delay})
++	g.history.DeleteURLTestHistory(nodes[0].Tag())
++	setResult(g, nodes[1].Tag(), 300)
++	setResult(g, nodes[2].Tag(), 10)
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, nodes[2])
++	g.recoveryFailed(nodes[0].Tag())
++	setResult(g, nodes[0].Tag(), 1)
++	g.performUpdateCheck()
++	assertSelected(t, g, N.NetworkTCP, nodes[2])
++	g.setFrozen(nodes[2].Tag(), time.Now())
++	chosen, alive := g.selectAmong(N.NetworkTCP, g.skipFrozen(nil))
++	require.True(t, alive)
++	require.Equal(t, adapter.Outbound(nodes[1]), chosen)
++	g.history.DeleteURLTestHistory(nodes[1].Tag())
++	g.history.DeleteURLTestHistory(nodes[2].Tag())
++	chosen, alive = g.Select(N.NetworkTCP)
++	require.True(t, alive)
++	require.Equal(t, adapter.Outbound(nodes[0]), chosen, "only responding recovering member remains usable")
++}
++
++func TestFallbackSelectionConfiguration(t *testing.T) {
++	_, err := NewURLTest(context.Background(), nil, log.NewNOPFactory().NewLogger("test"), "group", option.URLTestOutboundOptions{
++		Outbounds: []string{"a"}, Fallbacks: []string{"b"}, FallbackSelection: "invalid",
++	})
++	require.ErrorContains(t, err, "unknown fallback_selection")
++}
