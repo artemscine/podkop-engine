@@ -233,6 +233,23 @@ func TestCreateAndLookup(t *testing.T) {
 	}
 }
 
+// Peek tells the address of a domain that has one and gives none to a domain that has not.
+func TestPeek(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t, nil, "198.18.0.0/15", "")
+	_, known := store.Peek("example.com", false)
+	require.False(t, known)
+	_, known = store.Peek("example.com", false)
+	require.False(t, known, "the first Peek gave the domain an address")
+	first := mustCreate(t, store, "example.com")
+	seen, known := store.Peek("Example.COM", false)
+	require.True(t, known)
+	require.Equal(t, first, seen)
+	_, known = store.Peek("example.com", true)
+	require.False(t, known, "no IPv6 range, no IPv6 address")
+	require.Equal(t, address("198.18.0.3"), mustCreate(t, store, "example.org"), "a Peek took an address")
+}
+
 func TestMissingRange(t *testing.T) {
 	t.Parallel()
 	store := newTestStore(t, nil, "198.18.0.0/15", "")
