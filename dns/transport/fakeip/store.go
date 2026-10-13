@@ -589,6 +589,27 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 	}
 }
 
+// Peek returns the address a domain has, if it has one. Unlike Create it gives no address
+// to a domain that has none, and it does not count as a use of the record: it is for
+// those who ask whether a domain was ever looked up, not for those who look it up.
+func (s *Store) Peek(domain string, isIPv6 bool) (netip.Addr, bool) {
+	p := s.pool4
+	if isIPv6 {
+		p = s.pool6
+	}
+	if p == nil {
+		return netip.Addr{}, false
+	}
+	domain = strings.ToLower(domain)
+	s.access.RLock()
+	defer s.access.RUnlock()
+	r := p.byName[domain]
+	if r == nil {
+		return netip.Addr{}, false
+	}
+	return p.address(r.offset), true
+}
+
 const (
 	needNothing = iota
 	needReserve // the saved reserve is used up
