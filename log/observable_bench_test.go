@@ -11,6 +11,18 @@ type consoleWriter struct{}
 
 func (consoleWriter) Write(p []byte) (int, error) { return len(p), nil }
 
+// platformWriter stands for the writer of an app or of a program that embeds sing-box:
+// one that takes every level, and one with a level of its own that wants no colours.
+type platformWriter struct{}
+
+func (platformWriter) WriteMessage(level Level, message string) {}
+
+type leveledPlatformWriter struct{ level Level }
+
+func (leveledPlatformWriter) WriteMessage(level Level, message string) {}
+func (w leveledPlatformWriter) Level() Level                           { return w.level }
+func (leveledPlatformWriter) DisableColors() bool                      { return true }
+
 // A debug line below the warn level, as the router and DNS write for every connection and
 // query, with the Clash API on (observable) or off.
 func BenchmarkLogBelowLevel(b *testing.B) {
@@ -18,13 +30,16 @@ func BenchmarkLogBelowLevel(b *testing.B) {
 		name       string
 		observable bool
 		subscribe  bool
+		platform   PlatformWriter
 	}{
-		{"clash api off", false, false},
-		{"clash api on", true, false},
-		{"clash api on, logs subscribed", true, true},
+		{"clash api off", false, false, nil},
+		{"clash api on", true, false, nil},
+		{"clash api on, logs subscribed", true, true, nil},
+		{"platform writer without a level", false, false, platformWriter{}},
+		{"platform writer at warn", false, false, leveledPlatformWriter{LevelWarn}},
 	} {
 		b.Run(testCase.name, func(b *testing.B) {
-			factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", nil, testCase.observable)
+			factory := NewDefaultFactory(context.Background(), Formatter{BaseTime: time.Now()}, consoleWriter{}, "", testCase.platform, testCase.observable)
 			factory.SetLevel(LevelWarn)
 			if err := factory.Start(); err != nil {
 				b.Fatal(err)

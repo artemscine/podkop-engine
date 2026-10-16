@@ -173,13 +173,37 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
 	if f.observed() {
 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
 	}
-	platformWriters := f.loadPlatformWriters()
-	if len(platformWriters) > 0 {
-		platformMessage := f.platformFormatter.Format(ctx, level, tag, message, timestamp)
-		for _, platformWriter := range platformWriters {
-			platformWriter.WriteMessage(level, platformMessage)
+	// formatted once for the writers that want colours and once for those that do not,
+	// and only when one of them takes the level
+	var coloured, plain string
+	for _, platformWriter := range f.loadPlatformWriters() {
+		if !platformTakes(platformWriter, level) {
+			continue
+		}
+		if platformPlain(platformWriter) {
+			if plain == "" {
+				formatter := f.platformFormatter
+				formatter.DisableColors = true
+				plain = formatter.Format(ctx, level, tag, message, timestamp)
+			}
+			platformWriter.WriteMessage(level, plain)
+		} else {
+			if coloured == "" {
+				coloured = f.platformFormatter.Format(ctx, level, tag, message, timestamp)
+			}
+			platformWriter.WriteMessage(level, coloured)
 		}
 	}
+}
+
+// platformWants tells whether a platform writer takes an entry of the level.
+func (f *defaultFactory) platformWants(level Level) bool {
+	for _, platformWriter := range f.loadPlatformWriters() {
+		if platformTakes(platformWriter, level) {
+			return true
+		}
+	}
+	return false
 }
 
 var _ ContextLogger = (*observableLogger)(nil)
@@ -191,8 +215,7 @@ type observableLogger struct {
 
 func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 	level = OverrideLevelFromContext(level, ctx)
-	platformWriters := l.loadPlatformWriters()
-	if level > l.level && len(platformWriters) == 0 && !l.observed() {
+	if level > l.level && !l.platformWants(level) && !l.observed() {
 		return
 	}
 	nowTime := time.Now()
