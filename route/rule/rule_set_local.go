@@ -144,6 +144,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 		if err != nil {
 			return err
 		}
+	default:
 		return E.New("unknown rule-set format: ", s.fileFormat)
 	}
 	plainRuleSet, err := ruleSet.Upgrade()

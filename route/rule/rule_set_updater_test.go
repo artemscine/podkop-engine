@@ -67,3 +67,42 @@ func TestRuleSetUpdaterUpdateNow(t *testing.T) {
 func TestRuleSetUpdaterWithoutRemoteRuleSets(t *testing.T) {
 	require.Nil(t, NewRuleSetUpdater(context.Background(), nil))
 }
+
+// Rule-sets due together are downloaded together, ruleSetUpdateConcurrency at a time: six
+// sets whose server answers after 300 ms take two rounds, not six.
+func TestRuleSetUpdaterConcurrent(t *testing.T) {
+	var inFlight, most atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			seen := most.Load()
+			if now <= seen || most.CompareAndSwap(seen, now) {
+				break
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+		io.WriteString(w, testSourceSet)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sets := make([]adapter.RuleSet, 6)
+	for index := range sets {
+		set := newTestRuleSet(server.URL)
+		set.ctx = ctx
+		set.options.Format = C.RuleSetFormatSource
+		set.updateInterval = time.Hour
+		set.lastUpdated = time.Now()
+		sets[index] = set
+	}
+	updater := NewRuleSetUpdater(ctx, sets)
+	updater.Start()
+	defer updater.Close()
+	started := time.Now()
+	summary, err := updater.UpdateNow(ctx)
+	require.NoError(t, err)
+	require.Equal(t, RuleSetUpdateSummary{Total: 6, Loaded: 6}, summary)
+	require.EqualValues(t, ruleSetUpdateConcurrency, most.Load())
+	require.Less(t, time.Since(started), 1500*time.Millisecond, "the sets were downloaded one by one")
+}
