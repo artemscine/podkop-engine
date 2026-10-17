@@ -78,3 +78,23 @@ func TestRemoteRuleSetCallbackAfterCache(t *testing.T) {
 	require.NoError(t, set.fetch(context.Background(), false))
 	require.Equal(t, string(content), string(seen))
 }
+
+// A list written as text is downloaded and matched as any rule-set; a page served in its
+// place is refused, and the rules it had stay.
+func TestRemoteRuleSetText(t *testing.T) {
+	var body atomic.Value
+	body.Store("example.com\n10.0.0.0/8\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body.Load().(string)))
+	}))
+	defer server.Close()
+	set := newTestRuleSet(server.URL)
+	set.ctx = context.Background()
+	set.options.Format = C.RuleSetFormatText
+	require.NoError(t, set.fetch(context.Background(), false))
+	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
+	require.False(t, set.Match(&adapter.InboundContext{Domain: "example.org"}))
+	body.Store("<html><body>\nAccess to this resource is blocked\n</body></html>\n")
+	require.Error(t, set.fetch(context.Background(), false))
+	require.True(t, set.Match(&adapter.InboundContext{Domain: "www.example.com"}))
+}
