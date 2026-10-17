@@ -3,6 +3,7 @@ package rule
 import (
 	"context"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -55,9 +56,15 @@ func (u *RuleSetUpdater) Close() error {
 	return nil
 }
 
+// ruleSetUpdateConcurrency is how many rule-sets an update downloads at once, as many as
+// the start does (route.Router): rule-sets that start empty, or that are due together,
+// are not fetched one after another.
+const ruleSetUpdateConcurrency = 5
+
 // UpdateNow updates every remote rule-set at once, whatever its update_interval, and
-// returns what that came to. The update runs where the scheduled ones run, one rule-set
-// after another; the next scheduled update of each is counted from now.
+// returns what that came to. The update runs where the scheduled ones run, up to
+// ruleSetUpdateConcurrency rule-sets at a time; the next scheduled update of each is
+// counted from now.
 func (u *RuleSetUpdater) UpdateNow(ctx context.Context) (RuleSetUpdateSummary, error) {
 	reply := make(chan RuleSetUpdateSummary, 1)
 	select {
@@ -97,15 +104,20 @@ func (u *RuleSetUpdater) loopUpdate() {
 		now := time.Now()
 		var loaded bool
 		summary := RuleSetUpdateSummary{Total: len(u.ruleSets)}
-		for i, ruleSet := range u.ruleSets {
+		var due []int
+		for i := range u.ruleSets {
 			if reply == nil && now.Before(nextUpdates[i]) {
 				continue
 			}
-			failures := ruleSet.failures
-			if ruleSet.updateOnce() {
+			due = append(due, i)
+		}
+		results := u.updateAll(due)
+		for _, i := range due {
+			ruleSet := u.ruleSets[i]
+			if results[i].loaded {
 				loaded = true
 				summary.Loaded++
-			} else if ruleSet.failures > failures {
+			} else if results[i].failed {
 				summary.Failed++
 			}
 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
@@ -131,6 +143,34 @@ func (u *RuleSetUpdater) loopUpdate() {
 		}
 		timer.Reset(waitUntilNext(nextUpdates))
 	}
+}
+
+// updateResult is what one update of a rule-set came to.
+type updateResult struct {
+	loaded bool
+	failed bool
+}
+
+// updateAll updates the rule-sets of the indexes, ruleSetUpdateConcurrency at a time, and
+// returns what each came to, by index. A rule-set is touched by one goroutine only.
+func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
+	results := make([]updateResult, len(u.ruleSets))
+	slots := make(chan struct{}, ruleSetUpdateConcurrency)
+	var group sync.WaitGroup
+	for _, i := range indexes {
+		group.Add(1)
+		slots <- struct{}{}
+		go func(i int) {
+			defer group.Done()
+			defer func() { <-slots }()
+			ruleSet := u.ruleSets[i]
+			failures := ruleSet.failures
+			results[i].loaded = ruleSet.updateOnce()
+			results[i].failed = !results[i].loaded && ruleSet.failures > failures
+		}(i)
+	}
+	group.Wait()
+	return results
 }
 
 func waitUntilNext(nextUpdates []time.Time) time.Duration {
