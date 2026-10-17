@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/domainset"
+	"github.com/sagernet/sing-box/common/ruletext"
 	"github.com/sagernet/sing-box/common/srs"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -134,7 +135,15 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 		if err != nil {
 			return err
 		}
-	default:
+	case C.RuleSetFormatText:
+		content, err := filemanager.ReadFile(s.ctx, path)
+		if err != nil {
+			return err
+		}
+		ruleSet, _, err = ruletext.Read(content)
+		if err != nil {
+			return err
+		}
 		return E.New("unknown rule-set format: ", s.fileFormat)
 	}
 	plainRuleSet, err := ruleSet.Upgrade()

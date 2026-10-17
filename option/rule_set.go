@@ -96,7 +96,7 @@ func (r *RuleSet) UnmarshalJSON(bytes []byte) error {
 		switch r.Format {
 		case "":
 			return E.New("missing format")
-		case C.RuleSetFormatSource, C.RuleSetFormatBinary:
+		case C.RuleSetFormatSource, C.RuleSetFormatBinary, C.RuleSetFormatText:
 		default:
 			return E.New("unknown rule-set format: " + r.Format)
 		}
@@ -144,7 +144,7 @@ func (r RuleSet) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
 			return nil, err
 		}
 		tagNode := schema.ListableOf(schema.StringNode())
-		formatNode := schema.StringEnum(C.RuleSetFormatSource, C.RuleSetFormatBinary)
+		formatNode := schema.StringEnum(C.RuleSetFormatSource, C.RuleSetFormatBinary, C.RuleSetFormatText)
 
 		inlineVariant := schema.StrictObject()
 		inlineVariant.Properties.Put("type", schema.StringEnum(C.RuleSetTypeInline, ""))

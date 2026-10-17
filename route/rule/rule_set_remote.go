@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/domainset"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/ruletext"
 	"github.com/sagernet/sing-box/common/srs"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
@@ -277,6 +278,15 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 		ruleSet, err = srs.ReadSets(bytes.NewReader(content))
 		if err != nil {
 			return err
+		}
+	case C.RuleSetFormatText:
+		var skipped ruletext.Skipped
+		ruleSet, skipped, err = ruletext.Read(content)
+		if err != nil {
+			return err
+		}
+		if skipped.Count > 0 {
+			s.logger.Warn("rule-set ", s.tag, ": ", skipped.Count, " line(s) are neither a domain nor an IP CIDR and are left out, the first: ", logText(E.New(skipped.First)))
 		}
 	default:
 		return E.New("unknown rule-set format: ", s.options.Format)
