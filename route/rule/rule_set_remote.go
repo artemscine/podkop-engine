@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -158,22 +159,52 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		}
 	}
 	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
-		err = s.fetch(ctx, true)
-		if err != nil {
-			// Start with an empty rule-set instead of failing the whole start:
-			// RuleSetUpdater keeps retrying until the first download succeeds.
-			s.logger.Error("initial rule-set: ", s.tag, ", starting empty and retrying: ", logText(err))
-			s.startedEmpty = true
-			// The DNS router decides its rule mode from the metadata of the referenced sets
-			// when it starts, right after this. Until the content is known, report it as
-			// mixed (domains and IP CIDRs): that is the only answer every later content is
-			// compatible with under the DNS router's update validator.
-			s.access.Lock()
-			s.contentUnknown = true
-			s.access.Unlock()
-		}
+		s.startWithNothingLoaded(ctx)
 	}
 	return nil
+}
+
+// startWithNothingLoaded starts a set that has neither a cached nor an initial content.
+func (s *RemoteRuleSet) startWithNothingLoaded(ctx context.Context) {
+	if ruleSetStartEmpty() {
+		// nothing waits for the download: the inbounds start now, the updater fetches the
+		// set right after the start and the callbacks tell who needs to know
+		s.logger.Info("initial rule-set: ", s.tag, ", nothing cached: starting empty, downloading in the background")
+		s.startEmpty()
+		return
+	}
+	err := s.fetch(ctx, true)
+	if err != nil {
+		// Start with an empty rule-set instead of failing the whole start:
+		// RuleSetUpdater keeps retrying until the first download succeeds.
+		s.logger.Error("initial rule-set: ", s.tag, ", starting empty and retrying: ", logText(err))
+		s.startEmpty()
+	}
+}
+
+// ruleSetStartEmpty tells whether a remote rule-set with nothing cached and no initial
+// file starts empty at once instead of downloading its list during the start
+// (SING_BOX_RULE_SET_START_EMPTY set to anything). The start downloads the sets five at
+// a time, each up to the start deadline, and the inbounds wait for all of them: a box
+// that replaces another one (a program that applies a new configuration, a restart) is
+// deaf for that long. Starting empty, the box answers at once and the rules that use
+// the set match nothing until the download comes; what they would have matched in the
+// meantime goes by the other rules.
+var ruleSetStartEmpty = func() bool {
+	return os.Getenv("SING_BOX_RULE_SET_START_EMPTY") != ""
+}
+
+// startEmpty marks a set that starts without content; the updater fetches it at once
+// and then retries with a backoff until the first download succeeds.
+func (s *RemoteRuleSet) startEmpty() {
+	s.startedEmpty = true
+	// The DNS router decides its rule mode from the metadata of the referenced sets
+	// when it starts, right after this. Until the content is known, report it as
+	// mixed (domains and IP CIDRs): that is the only answer every later content is
+	// compatible with under the DNS router's update validator.
+	s.access.Lock()
+	s.contentUnknown = true
+	s.access.Unlock()
 }
 
 func (s *RemoteRuleSet) Metadata() adapter.RuleSetMetadata {
@@ -219,7 +250,19 @@ func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSet
 	s.callbacks.Remove(element)
 }
 
+// loadBytes takes a new content and runs the callbacks.
 func (s *RemoteRuleSet) loadBytes(content []byte) error {
+	err := s.commitBytes(content)
+	if err != nil {
+		return err
+	}
+	s.notifyUpdated()
+	return nil
+}
+
+// commitBytes takes a new content without telling anyone: a download tells the callbacks
+// once the content is in the cache file too.
+func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	var (
 		ruleSet option.PlainRuleSetCompat
 		err     error
@@ -258,12 +301,19 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 	s.metadata = metadata
 	s.rules = rules
 	s.contentUnknown = false
-	callbacks := s.callbacks.Array()
 	s.access.Unlock()
+	return nil
+}
+
+// notifyUpdated runs the callbacks of a new content. A download calls it once the content
+// is saved to the cache file as well: a callback may read the set from there.
+func (s *RemoteRuleSet) notifyUpdated() {
+	s.access.RLock()
+	callbacks := s.callbacks.Array()
+	s.access.RUnlock()
 	for _, callback := range callbacks {
 		callback(s)
 	}
-	return nil
 }
 
 // updateOnce updates the rule-set and reports whether it loaded a new list.
@@ -504,7 +554,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return describe(err)
 	}
-	err = s.loadBytes(content)
+	err = s.commitBytes(content)
 	if err != nil {
 		return E.Cause(err, "read rule-set (", describeRuleSetBody(response, int64(len(content)), content), ")")
 	}
@@ -526,6 +576,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 		}
 	}
 	s.logger.Info("updated rule-set ", s.tag)
+	s.notifyUpdated()
 	return nil
 }
 
