@@ -52,6 +52,17 @@ const (
 )
 
 func Read(reader io.Reader, recover bool) (ruleSetCompat option.PlainRuleSetCompat, err error) {
+	return read(reader, recover, false)
+}
+
+// ReadSets is Read for a rule set that is matched: the lists of source_ip_cidr and
+// ip_cidr come as cidrset.Set (SourceIPRanges, IPRanges), read into ranges of their own,
+// not as netipx.IPSet.
+func ReadSets(reader io.Reader) (option.PlainRuleSetCompat, error) {
+	return read(reader, false, true)
+}
+
+func read(reader io.Reader, recover bool, sets bool) (ruleSetCompat option.PlainRuleSetCompat, err error) {
 	var magicBytes [3]byte
 	_, err = io.ReadFull(reader, magicBytes[:])
 	if err != nil {
@@ -81,7 +92,7 @@ func Read(reader io.Reader, recover bool) (ruleSetCompat option.PlainRuleSetComp
 	ruleSetCompat.Version = version
 	for i := range length {
 		var rule option.HeadlessRule
-		rule, err = readRule(bReader, recover, 0)
+		rule, err = readRule(bReader, recover, sets, 0)
 		if err != nil {
 			err = E.Cause(err, "read rule[", i, "]")
 			return
@@ -124,7 +135,7 @@ func Write(writer io.Writer, ruleSet option.PlainRuleSet, generateVersion uint8)
 
 const maxLogicalRuleDepth = 100
 
-func readRule(reader varbin.Reader, recover bool, depth int) (rule option.HeadlessRule, err error) {
+func readRule(reader varbin.Reader, recover bool, sets bool, depth int) (rule option.HeadlessRule, err error) {
 	if depth > maxLogicalRuleDepth {
 		err = E.New("logical rule nested too deep")
 		return
@@ -137,10 +148,10 @@ func readRule(reader varbin.Reader, recover bool, depth int) (rule option.Headle
 	switch ruleType {
 	case 0:
 		rule.Type = C.RuleTypeDefault
-		rule.DefaultOptions, err = readDefaultRule(reader, recover)
+		rule.DefaultOptions, err = readDefaultRule(reader, recover, sets)
 	case 1:
 		rule.Type = C.RuleTypeLogical
-		rule.LogicalOptions, err = readLogicalRule(reader, recover, depth)
+		rule.LogicalOptions, err = readLogicalRule(reader, recover, sets, depth)
 	default:
 		err = E.New("unknown rule type: ", ruleType)
 	}
@@ -158,7 +169,7 @@ func writeRule(writer varbin.Writer, rule option.HeadlessRule, generateVersion u
 	}
 }
 
-func readDefaultRule(reader varbin.Reader, recover bool) (rule option.DefaultHeadlessRule, err error) {
+func readDefaultRule(reader varbin.Reader, recover bool, sets bool) (rule option.DefaultHeadlessRule, err error) {
 	var lastItemType uint8
 	for {
 		var itemType uint8
@@ -193,6 +204,10 @@ func readDefaultRule(reader varbin.Reader, recover bool) (rule option.DefaultHea
 		case ruleItemDomainRegex:
 			rule.DomainRegex, err = readRuleItemString(reader)
 		case ruleItemSourceIPCIDR:
+			if sets {
+				rule.SourceIPRanges, err = readIPRanges(reader, true)
+				break
+			}
 			rule.SourceIPSet, err = readIPSet(reader)
 			if err != nil {
 				return
@@ -201,6 +216,10 @@ func readDefaultRule(reader varbin.Reader, recover bool) (rule option.DefaultHea
 				rule.SourceIPCIDR = common.Map(rule.SourceIPSet.Prefixes(), netip.Prefix.String)
 			}
 		case ruleItemIPCIDR:
+			if sets {
+				rule.IPRanges, err = readIPRanges(reader, false)
+				break
+			}
 			rule.IPSet, err = readIPSet(reader)
 			if err != nil {
 				return
@@ -621,7 +640,7 @@ func writeRuleItemCIDR(writer varbin.Writer, itemType uint8, value []string) err
 	return writeIPSet(writer, ipSet)
 }
 
-func readLogicalRule(reader varbin.Reader, recovery bool, depth int) (logicalRule option.LogicalHeadlessRule, err error) {
+func readLogicalRule(reader varbin.Reader, recovery bool, sets bool, depth int) (logicalRule option.LogicalHeadlessRule, err error) {
 	mode, err := reader.ReadByte()
 	if err != nil {
 		return
@@ -641,7 +660,7 @@ func readLogicalRule(reader varbin.Reader, recovery bool, depth int) (logicalRul
 	}
 	for i := range length {
 		var rule option.HeadlessRule
-		rule, err = readRule(reader, recovery, depth+1)
+		rule, err = readRule(reader, recovery, sets, depth+1)
 		if err != nil {
 			err = E.Cause(err, "read logical rule [", i, "]")
 			return
