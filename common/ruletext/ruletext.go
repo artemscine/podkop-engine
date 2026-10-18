@@ -53,6 +53,10 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		domains  int
 	)
 	names := domainset.NewCollector(content)
+	if build {
+		// a name a line at most: room made once
+		names.Grow(bytes.Count(content, []byte{'\n'}) + 1)
+	}
 	seenPrefixes := make(map[string]bool)
 	for offset := 0; offset < len(content); {
 		lineStart := offset
