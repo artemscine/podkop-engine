@@ -1,7 +1,11 @@
 package ruletext
 
 import (
+	"bytes"
+	"strings"
 	"testing"
+
+	"github.com/sagernet/sing/common/domain"
 
 	"github.com/stretchr/testify/require"
 )
@@ -11,7 +15,8 @@ func TestRead(t *testing.T) {
 	ruleSet, skipped, err := Read([]byte("# a list\nexample.com\n.Sub.Example.ORG\n+.x.example\n  .ru  \n10.0.0.0/8\n192.0.2.1 # one address\n2001:db8::/32 // addresses\nnot a domain\nwords\nexample.com\nlast.example"))
 	require.NoError(t, err)
 	require.Len(t, ruleSet.Options.Rules, 2)
-	require.Equal(t, []string{"example.com", "sub.example.org", "x.example", "ru", "last.example"}, []string(ruleSet.Options.Rules[0].DefaultOptions.DomainSuffix))
+	require.Equal(t, written(t, domain.NewMatcher(nil, []string{"example.com", "sub.example.org", "x.example", "ru", "last.example"}, false)),
+		written(t, ruleSet.Options.Rules[0].DefaultOptions.DomainMatcher))
 	require.Equal(t, []string{"10.0.0.0/8", "192.0.2.1/32", "2001:db8::/32"}, []string(ruleSet.Options.Rules[1].DefaultOptions.IPCIDR))
 	require.Equal(t, Skipped{Count: 2, First: "not a domain"}, skipped)
 
@@ -26,4 +31,48 @@ func TestRead(t *testing.T) {
 	require.Equal(t, 4, skipped.Count)
 	_, _, err = Read([]byte("\n# nothing\n"))
 	require.Error(t, err)
+}
+
+// written is a matcher as a rule set carries it after it was read once: a matcher that
+// domain.ReadMatcher made pads its leaves.
+func written(t *testing.T, matcher *domain.Matcher) []byte {
+	var content bytes.Buffer
+	require.NoError(t, matcher.Write(&content))
+	read, err := domain.ReadMatcher(bytes.NewReader(content.Bytes()))
+	require.NoError(t, err)
+	content.Reset()
+	require.NoError(t, read.Write(&content))
+	return content.Bytes()
+}
+
+// The names of a list come in place or copied, in capitals or not, with a "+." or a dot
+// in front or after them, not of ASCII: the matcher is the one of the names as the
+// reading of a list takes them one by one (parseDomain).
+func TestReadNames(t *testing.T) {
+	lines := []string{
+		"plain.example", "Capital.Example", "+.plus.example", ".dot.example", "end.example.", "  spaced.example  ",
+		"\u212aelvin.example", "дом.рф", "under_score.example", "x--y.example", "a.b.c.d.e", "plain.example", ".ru",
+		"-bad.example", "bad-.example", "a..b", "word", "10.0.0.1", "10.0.0.0/8", "2001:db8::/32", "1.2.3.example",
+	}
+	var expected []string
+	for _, line := range lines {
+		item := strings.TrimSpace(line)
+		if _, isPrefix := parsePrefix(item); isPrefix {
+			continue
+		}
+		if domain, isDomain := parseDomain(item); isDomain {
+			expected = append(expected, domain)
+		}
+	}
+	ruleSet, skipped, err := Read([]byte(strings.Join(lines, "\n")))
+	require.NoError(t, err)
+	require.Equal(t, 5, skipped.Count)
+	require.Equal(t, written(t, domain.NewMatcher(nil, expected, false)), written(t, ruleSet.Options.Rules[0].DefaultOptions.DomainMatcher))
+	require.Equal(t, []string{"10.0.0.1/32", "10.0.0.0/8", "2001:db8::/32"}, []string(ruleSet.Options.Rules[1].DefaultOptions.IPCIDR))
+	// without the matcher: the same addresses, the same lines left out
+	addresses, skippedToo, err := ReadAddresses([]byte(strings.Join(lines, "\n")))
+	require.NoError(t, err)
+	require.Equal(t, skipped, skippedToo)
+	require.Len(t, addresses.Options.Rules, 1)
+	require.Equal(t, ruleSet.Options.Rules[1], addresses.Options.Rules[0])
 }

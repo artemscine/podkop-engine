@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/sagernet/sing-box/common/domainset"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -31,69 +32,194 @@ type Skipped struct {
 // "." or "+." (a suffix either way) and is taken in lower case. A list without a single
 // item is an error: a page served in place of the list (a block page, a captive
 // portal) is no list, and a line of it is no item.
+//
+// The domains come as the matcher of the rule (DomainMatcher), built by common/domainset
+// from where they are in the content: a name in lower case already is not copied.
 func Read(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
+	return read(content, true)
+}
+
+// ReadAddresses is Read without the matcher of the domains, for those who want the
+// addresses of the list and whether sing-box takes it: the domains are checked and
+// counted, not built.
+func ReadAddresses(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
+	return read(content, false)
+}
+
+func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
 	var (
-		domains  []string
 		prefixes []string
 		skipped  Skipped
+		domains  int
 	)
-	seenDomains := make(map[string]bool)
+	names := domainset.NewCollector(content)
 	seenPrefixes := make(map[string]bool)
-	for len(content) > 0 {
-		var line []byte
-		end := bytes.IndexByte(content, '\n')
-		if end < 0 {
-			line, content = content, nil
+	for offset := 0; offset < len(content); {
+		lineStart := offset
+		lineEnd := bytes.IndexByte(content[offset:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(content)
+			offset = len(content)
 		} else {
-			line, content = content[:end], content[end+1:]
+			lineEnd += offset
+			offset = lineEnd + 1
 		}
+		line := content[lineStart:lineEnd]
 		if comment := bytes.IndexByte(line, '#'); comment >= 0 {
 			line = line[:comment]
 		}
 		if comment := bytes.Index(line, []byte("//")); comment >= 0 {
 			line = line[:comment]
 		}
-		item := string(bytes.TrimSpace(line))
-		if item == "" {
+		item := bytes.TrimSpace(line)
+		if len(item) == 0 {
 			continue
 		}
-		if prefix, isPrefix := parsePrefix(item); isPrefix {
-			text := prefix.String()
-			if !seenPrefixes[text] {
-				seenPrefixes[text] = true
-				prefixes = append(prefixes, text)
+		if mayBeAddress(item) {
+			if prefix, isPrefix := parsePrefix(string(item)); isPrefix {
+				text := prefix.String()
+				if !seenPrefixes[text] {
+					seenPrefixes[text] = true
+					prefixes = append(prefixes, text)
+				}
+				continue
+			}
+		}
+		if from, to, isDomain := parseASCIIDomain(item); isDomain {
+			domains++
+			if build {
+				// the item is a part of the content: where it is, from what is left after it
+				start := cap(content) - cap(item[from:])
+				if hasUpper(item[from:to]) {
+					err := names.AddBytes(bytes.ToLower(item[from:to]), true)
+					if err != nil {
+						return option.PlainRuleSetCompat{}, skipped, err
+					}
+				} else {
+					err := names.Add(start, start+to-from, true)
+					if err != nil {
+						return option.PlainRuleSetCompat{}, skipped, err
+					}
+				}
 			}
 			continue
 		}
-		if domain, isDomain := parseDomain(item); isDomain {
-			if !seenDomains[domain] {
-				seenDomains[domain] = true
-				domains = append(domains, domain)
+		if !isASCII(item) {
+			// as strings.ToLower has it: a rune that is not ASCII may become ASCII
+			if domain, isDomain := parseDomain(string(item)); isDomain {
+				domains++
+				if build {
+					err := names.AddString(domain, true)
+					if err != nil {
+						return option.PlainRuleSetCompat{}, skipped, err
+					}
+				}
+				continue
 			}
-			continue
 		}
 		if skipped.Count == 0 {
-			skipped.First = item
+			skipped.First = string(item)
 			if len(skipped.First) > 64 {
 				skipped.First = skipped.First[:64]
 			}
 		}
 		skipped.Count++
 	}
-	if len(domains) == 0 && len(prefixes) == 0 {
+	if domains == 0 && len(prefixes) == 0 {
 		if skipped.Count > 0 {
 			return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list, the first line: ", skipped.First)
 		}
 		return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list")
 	}
 	var rules []option.HeadlessRule
-	if len(domains) > 0 {
-		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainSuffix: badoption.Listable[string](domains)}})
+	if build && names.Len() > 0 {
+		matcher, err := names.Matcher()
+		if err != nil {
+			return option.PlainRuleSetCompat{}, skipped, err
+		}
+		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainMatcher: matcher}})
 	}
 	if len(prefixes) > 0 {
 		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPCIDR: badoption.Listable[string](prefixes)}})
 	}
 	return option.PlainRuleSetCompat{Version: C.RuleSetVersionCurrent, Options: option.PlainRuleSet{Rules: rules}}, skipped, nil
+}
+
+// mayBeAddress tells an item that netip may read as an address or a CIDR: one with a
+// colon (IPv6), or of digits, dots and a slash only. The others are not tried: a failed
+// parse costs an error.
+func mayBeAddress(item []byte) bool {
+	if bytes.IndexByte(item, ':') >= 0 {
+		return true
+	}
+	for _, character := range item {
+		if !(character >= '0' && character <= '9' || character == '.' || character == '/') {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCII(item []byte) bool {
+	for _, character := range item {
+		if character >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasUpper(name []byte) bool {
+	for _, character := range name {
+		if character >= 'A' && character <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// parseASCIIDomain is parseDomain of an item of ASCII, in place: where the name is in
+// the item. Its letters may be capitals still.
+func parseASCIIDomain(item []byte) (int, int, bool) {
+	if !isASCII(item) {
+		return 0, 0, false
+	}
+	from, to := 0, len(item)
+	suffix := item[0] == '.' || bytes.HasPrefix(item, []byte("+."))
+	if item[from] == '+' {
+		from++
+	}
+	if from < to && item[from] == '.' {
+		from++
+	}
+	if from < to && item[to-1] == '.' {
+		to--
+	}
+	name := item[from:to]
+	if len(name) == 0 || len(name) > 253 || !suffix && bytes.IndexByte(name, '.') < 0 {
+		return 0, 0, false
+	}
+	for len(name) > 0 {
+		label := name
+		if dot := bytes.IndexByte(name, '.'); dot >= 0 {
+			label, name = name[:dot], name[dot+1:]
+			if len(name) == 0 {
+				// a dot at the end, the second one: an empty label
+				return 0, 0, false
+			}
+		} else {
+			name = nil
+		}
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return 0, 0, false
+		}
+		for _, character := range label {
+			if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_') {
+				return 0, 0, false
+			}
+		}
+	}
+	return from, to, true
 }
 
 func parsePrefix(item string) (netip.Prefix, bool) {
