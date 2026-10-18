@@ -10,11 +10,11 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/sagernet/sing-box/common/cidrset"
 	"github.com/sagernet/sing-box/common/domainset"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/json/badoption"
 )
 
 // Skipped is what a list had that is neither a domain nor an IP address or CIDR.
@@ -48,18 +48,18 @@ func ReadAddresses(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
 
 func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
 	var (
-		prefixes []string
-		skipped  Skipped
-		domains  int
+		skipped Skipped
+		domains int
 		// the first names, for the description of the rule
 		first []string
+		// the addresses, how many items there are, the first of them
+		addresses    cidrset.Builder
+		addressCount int
+		addressFirst []string
+		items        int
+		lines        = bytes.Count(content, []byte{'\n'}) + 1
 	)
 	names := domainset.NewCollector(content)
-	if build {
-		// a name a line at most: room made once
-		names.Grow(bytes.Count(content, []byte{'\n'}) + 1)
-	}
-	seenPrefixes := make(map[string]bool)
 	for offset := 0; offset < len(content); {
 		lineStart := offset
 		lineEnd := bytes.IndexByte(content[offset:], '\n')
@@ -81,12 +81,25 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		if len(item) == 0 {
 			continue
 		}
+		items++
 		if mayBeAddress(item) {
-			if prefix, isPrefix := parsePrefix(string(item)); isPrefix {
-				text := prefix.String()
-				if !seenPrefixes[text] {
-					seenPrefixes[text] = true
-					prefixes = append(prefixes, text)
+			if addressCount == 0 {
+				// an item a line at most from here: room made once
+				addresses.Grow(lines - items + 1)
+			}
+			if from, to, ok := cidrset.Parse4(item); ok {
+				addresses.Add4(from, to)
+				addressCount++
+				if len(addressFirst) < 3 {
+					prefix, _ := parsePrefix(string(item))
+					addressFirst = append(addressFirst, prefix.String())
+				}
+				continue
+			}
+			if prefix, isPrefix := parsePrefix(string(item)); isPrefix && addresses.AddPrefix(prefix) {
+				addressCount++
+				if len(addressFirst) < 3 {
+					addressFirst = append(addressFirst, prefix.String())
 				}
 				continue
 			}
@@ -94,6 +107,10 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		if from, to, isDomain := parseASCIIDomain(item); isDomain {
 			domains++
 			if build {
+				if domains == 1 {
+					// a name a line at most from here: room made once
+					names.Grow(lines - items + 1)
+				}
 				// the item is a part of the content: where it is, from what is left after it
 				start := cap(content) - cap(item[from:])
 				if len(first) < 3 {
@@ -137,7 +154,7 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		}
 		skipped.Count++
 	}
-	if domains == 0 && len(prefixes) == 0 {
+	if domains == 0 && addressCount == 0 {
 		if skipped.Count > 0 {
 			return option.PlainRuleSetCompat{}, skipped, E.New("no domain and no IP CIDR in the list, the first line: ", skipped.First)
 		}
@@ -151,8 +168,9 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		}
 		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainSet: set}})
 	}
-	if len(prefixes) > 0 {
-		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPCIDR: badoption.Listable[string](prefixes)}})
+	if addressCount > 0 {
+		set := addresses.Set(cidrset.Describe(false, addressFirst, addressCount))
+		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPRanges: set}})
 	}
 	return option.PlainRuleSetCompat{Version: C.RuleSetVersionCurrent, Options: option.PlainRuleSet{Rules: rules}}, skipped, nil
 }

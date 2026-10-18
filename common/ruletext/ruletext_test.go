@@ -2,6 +2,7 @@ package ruletext
 
 import (
 	"bytes"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -18,7 +19,9 @@ func TestRead(t *testing.T) {
 	require.Len(t, ruleSet.Options.Rules, 2)
 	require.Equal(t, written(t, domain.NewMatcher(nil, []string{"example.com", "sub.example.org", "x.example", "ru", "last.example"}, false)),
 		written(t, ruleSet.Options.Rules[0].DefaultOptions.DomainSet))
-	require.Equal(t, []string{"10.0.0.0/8", "192.0.2.1/32", "2001:db8::/32"}, []string(ruleSet.Options.Rules[1].DefaultOptions.IPCIDR))
+	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.0.2.1/32"), netip.MustParsePrefix("2001:db8::/32")},
+		ruleSet.Options.Rules[1].DefaultOptions.IPRanges.Prefixes())
+	require.Equal(t, "ip_cidr=[10.0.0.0/8 192.0.2.1/32 2001:db8::/32]", ruleSet.Options.Rules[1].DefaultOptions.IPRanges.String())
 	require.Equal(t, Skipped{Count: 2, First: "not a domain"}, skipped)
 
 	// the last line without a line end is read; a list of names alone has one rule
@@ -64,7 +67,9 @@ func TestReadNames(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 5, skipped.Count)
 	require.Equal(t, written(t, domain.NewMatcher(nil, expected, false)), written(t, ruleSet.Options.Rules[0].DefaultOptions.DomainSet))
-	require.Equal(t, []string{"10.0.0.1/32", "10.0.0.0/8", "2001:db8::/32"}, []string(ruleSet.Options.Rules[1].DefaultOptions.IPCIDR))
+	// 10.0.0.1 is in 10.0.0.0/8: the set holds the network
+	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("2001:db8::/32")},
+		ruleSet.Options.Rules[1].DefaultOptions.IPRanges.Prefixes())
 	// without the matcher: the same addresses, the same lines left out
 	addresses, skippedToo, err := ReadAddresses([]byte(strings.Join(lines, "\n")))
 	require.NoError(t, err)
