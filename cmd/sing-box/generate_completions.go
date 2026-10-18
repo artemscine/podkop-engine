@@ -2,7 +2,10 @@
 
 package main
 
-import "github.com/sagernet/sing-box/log"
+import (
+	"github.com/sagernet/sing-box/cmd/sing-box/cli"
+	"github.com/sagernet/sing-box/log"
+)
 
 func main() {
 	err := generateCompletions()
@@ -12,6 +15,7 @@ func main() {
 }
 
 func generateCompletions() error {
+	mainCommand := cli.Command()
 	err := mainCommand.GenBashCompletionFile("release/completions/sing-box.bash")
 	if err != nil {
 		return err
