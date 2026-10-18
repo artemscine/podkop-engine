@@ -33,8 +33,8 @@ type Skipped struct {
 // item is an error: a page served in place of the list (a block page, a captive
 // portal) is no list, and a line of it is no item.
 //
-// The domains come as the matcher of the rule (DomainMatcher), built by common/domainset
-// from where they are in the content: a name in lower case already is not copied.
+// The domains come as the trie of the rule (DomainSet), built by common/domainset from
+// where they are in the content: a name in lower case already is not copied.
 func Read(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
 	return read(content, true)
 }
@@ -51,6 +51,8 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		prefixes []string
 		skipped  Skipped
 		domains  int
+		// the first names, for the description of the rule
+		first []string
 	)
 	names := domainset.NewCollector(content)
 	if build {
@@ -94,6 +96,9 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 			if build {
 				// the item is a part of the content: where it is, from what is left after it
 				start := cap(content) - cap(item[from:])
+				if len(first) < 3 {
+					first = append(first, strings.ToLower(string(item[from:to])))
+				}
 				if hasUpper(item[from:to]) {
 					err := names.AddBytes(bytes.ToLower(item[from:to]), true)
 					if err != nil {
@@ -113,6 +118,9 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 			if domain, isDomain := parseDomain(string(item)); isDomain {
 				domains++
 				if build {
+					if len(first) < 3 {
+						first = append(first, domain)
+					}
 					err := names.AddString(domain, true)
 					if err != nil {
 						return option.PlainRuleSetCompat{}, skipped, err
@@ -137,11 +145,11 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 	}
 	var rules []option.HeadlessRule
 	if build && names.Len() > 0 {
-		matcher, err := names.Matcher()
+		set, err := names.Set(domainset.Describe(nil, 0, first, domains))
 		if err != nil {
 			return option.PlainRuleSetCompat{}, skipped, err
 		}
-		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainMatcher: matcher}})
+		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{DomainSet: set}})
 	}
 	if len(prefixes) > 0 {
 		rules = append(rules, option.HeadlessRule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{IPCIDR: badoption.Listable[string](prefixes)}})
