@@ -112,6 +112,10 @@ func (u *RuleSetUpdater) loopUpdate() {
 			due = append(due, i)
 		}
 		results := u.updateAll(due)
+		if u.ctx.Err() != nil {
+			// closed during the update: nothing recovered is told of a closed box
+			return
+		}
 		for _, i := range due {
 			ruleSet := u.ruleSets[i]
 			if results[i].loaded {

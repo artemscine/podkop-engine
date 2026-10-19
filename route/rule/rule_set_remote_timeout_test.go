@@ -15,6 +15,7 @@ import (
 
 func newTestRuleSet(url string) *RemoteRuleSet {
 	return &RemoteRuleSet{
+		ctx:        context.Background(),
 		logger:     log.NewNOPFactory().NewLogger("test"),
 		tag:        "test",
 		url:        url,
