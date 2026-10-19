@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/redirect"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
@@ -61,6 +62,9 @@ func OutboundRegistry() *outbound.Registry {
 	shadowsocks.RegisterOutbound(registry)
 	trojan.RegisterOutbound(registry)
 	vless.RegisterOutbound(registry)
+	// podkop writes no http outbound itself, but a local HTTP proxy (opera-proxy and the
+	// like) set as a raw outbound is common, and it costs a few kilobytes
+	http.RegisterOutbound(registry)
 	registerFullOutbounds(registry)
 
 	registerQUICOutbounds(registry)
