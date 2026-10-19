@@ -8,8 +8,7 @@
 //   - What it builds is what sing-box builds of the same input: the same matcher, byte for
 //     byte, and the same rules around it. Input it cannot read so is left to the code of
 //     sing-box (ReadSource), or refused with the reason (NewMatcher): it never guesses.
-//     Where sing stops the process (an empty suffix, a name and a suffix of the same key)
-//     it gives an error instead.
+//     Where sing stops the process (an empty suffix) it gives an error instead.
 //   - A name is not copied: a key of the trie is where the name is in the text it was
 //     read from, read from its end. Only a name written with escapes, or not ASCII, is
 //     copied, once.
@@ -28,6 +27,7 @@
 package domainset
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -46,6 +46,10 @@ type Matcher interface {
 // around them.
 func NewSet(domains []string, domainSuffix []string) (Matcher, error) {
 	if !validNames(domains, domainSuffix) {
+		// an empty suffix stops sing's build
+		if slices.Contains(domainSuffix, "") {
+			return nil, ErrEmptySuffix
+		}
 		return domain.NewMatcher(domains, domainSuffix, false), nil
 	}
 	collector, err := collect(domains, domainSuffix)
@@ -87,7 +91,7 @@ func Describe(domains []string, domainCount int, domainSuffix []string, domainSu
 // writes it, the form a rule set in the binary format carries.
 func Encode(domains []string, domainSuffix []string, generateLegacy bool) ([]byte, error) {
 	if generateLegacy || !validNames(domains, domainSuffix) {
-		return encodeSorted(domains, domainSuffix, generateLegacy), nil
+		return encodeSorted(domains, domainSuffix, generateLegacy)
 	}
 	collector, err := collect(domains, domainSuffix)
 	if err != nil {

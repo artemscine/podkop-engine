@@ -31,12 +31,8 @@ var (
 	// ErrEmptySuffix is an empty name in a list of suffixes: sing has no key for it (its
 	// domain.NewMatcher stops the process with an index out of range).
 	ErrEmptySuffix = E.New("an empty domain suffix")
-	// errSameKey is a name and a suffix that make the same key: a name that begins with
-	// "\n" or "\r" and a suffix without it. sing's trie cannot hold one key twice (its
-	// domain.NewMatcher stops the process with an index out of range).
-	errSameKey = E.New("a domain and a domain suffix that make the same key")
-	errTooLong = E.New("a list of domains too long to build")
-	errNotUTF8 = E.New("a domain that is not valid UTF-8")
+	errTooLong     = E.New("a list of domains too long to build")
+	errNotUTF8     = E.New("a domain that is not valid UTF-8")
 )
 
 // ref is a key of the trie: a name of length bytes at offset in one of the buffers of the

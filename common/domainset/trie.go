@@ -195,9 +195,8 @@ func (c *Collector) build() (trie, error) {
 				}
 				out = int(place)
 			}
-			if enderDomain && enderSuffix {
-				return trie{}, errSameKey
-			}
+			// a name and a suffix that make the same key (a name that begins with "\n" or
+			// "\r") are one key, as sing makes them (slices.Compact since v0.9.7)
 			if enderSuffix || enderDomain && !sameName {
 				setBit(&built.leaves, node)
 			}
