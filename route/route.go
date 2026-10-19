@@ -110,6 +110,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
 	if err != nil {
+		// what sniffing read before the failure goes back to its pool
+		buf.ReleaseMulti(buffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -282,6 +284,9 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
 	if err != nil {
+		// the packets sniffing held (a QUIC ClientHello split over datagrams) go back to
+		// their pool
+		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
