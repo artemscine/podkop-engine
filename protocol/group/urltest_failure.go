@@ -113,6 +113,7 @@ func (g *URLTestGroup) judgeFailure(tag string, member adapter.Outbound, network
 		}
 		g.logger.Info("outbound ", tag, " unavailable: ", err)
 		g.history.DeleteURLTestHistory(tag)
+		g.recoveryFailed(tag)
 	}
 	g.requestUpdateCheck()
 }
@@ -355,6 +356,7 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 		unavailable := func() {
 			g.logger.Info("outbound ", tag, " unavailable: ", err)
 			g.history.DeleteURLTestHistory(tag)
+			g.recoveryFailed(tag)
 			g.performUpdateCheck()
 		}
 		if localNetworkError(err) {

@@ -43,6 +43,8 @@ type URLTest struct {
 	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
 	tags                         []string
+	recoveryOptions              *option.URLTestFallbackRecoveryOptions
+	fallbackFastest              bool
 	fallbackTags                 []string
 	all                          []string
 	link                         string
@@ -56,6 +58,12 @@ type URLTest struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	if options.FallbackSelection != "" && options.FallbackSelection != "ordered" && options.FallbackSelection != "fastest" {
+		return nil, E.New("unknown fallback_selection: ", options.FallbackSelection)
+	}
+	if err := validateFallbackRecovery(options); err != nil {
+		return nil, err
+	}
 	// a new slice: appending to the decoded options could write into their array
 	all := slices.Concat(options.Outbounds, options.Fallbacks)
 	outbound := &URLTest{
@@ -66,6 +74,8 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:                       logger,
 		tags:                         options.Outbounds,
 		fallbackTags:                 options.Fallbacks,
+		recoveryOptions:              options.FallbackRecovery,
+		fallbackFastest:              options.FallbackSelection == "fastest",
 		all:                          all,
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
@@ -126,6 +136,8 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if err != nil {
 			return err
 		}
+		group.fallbackRecovery = newFallbackRecovery(s.recoveryOptions)
+		group.fallbackFastest = s.fallbackFastest
 		s.group = group
 	case adapter.StartStateStarted:
 		s.group.PostStart()
@@ -325,13 +337,15 @@ type URLTestGroup struct {
 	localFailures                sync.Map // member tag → a failure of this host's own network waits to be judged
 	// when the network last paused or woke, and when the pause in force was reported,
 	// since epoch (networkChangedSince, networkPaused)
-	networkEvent    atomic.Int64
-	networkPauseAt  atomic.Int64
-	networkCallback *list.Element[pause.Callback]
-	downloadLink    string
-	frozen          common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
-	responses       sync.Map                                // member tag → *memberResponses
-	responsesClosed atomic.Bool
+	networkEvent     atomic.Int64
+	networkPauseAt   atomic.Int64
+	networkCallback  *list.Element[pause.Callback]
+	fallbackRecovery *fallbackRecovery
+	fallbackFastest  bool
+	downloadLink     string
+	frozen           common.TypedValue[map[string]time.Time] // member tag → when it last failed the download test
+	responses        sync.Map                                // member tag → *memberResponses
+	responsesClosed  atomic.Bool
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -427,6 +441,15 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 // outbounds is chosen, by the tolerance; only when none of them is a candidate, the first
 // fallback that is, in the order of the list.
 func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history *adapter.URLTestHistory) bool) (adapter.Outbound, bool) {
+	chosen, alive := g.selectRecoveryAmong(network, skip, true)
+	if alive || g.fallbackRecovery == nil {
+		return chosen, alive
+	}
+	// When all confirmed paths are unavailable, a responding recovering member remains usable.
+	return g.selectRecoveryAmong(network, skip, false)
+}
+
+func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string, history *adapter.URLTestHistory) bool, confirmed bool) (adapter.Outbound, bool) {
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	var selected adapter.Outbound
@@ -439,7 +462,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 	// a fallback in use holds back no outbound: it is chosen only while none is a candidate
 	if selected != nil && !g.isFallback(selected) {
 		tag := RealTag(g.outbound, selected)
-		if history := g.history.LoadURLTestHistory(tag); history != nil && (skip == nil || !skip(tag, history)) {
+		if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
 			minOutbound = selected
 			minDelay = history.Delay
 		}
@@ -450,7 +473,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 		}
 		tag := RealTag(g.outbound, detour)
 		history := g.history.LoadURLTestHistory(tag)
-		if history == nil || (skip != nil && skip(tag, history)) {
+		if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 			continue
 		}
 		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
@@ -459,16 +482,30 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 		}
 	}
 	if minOutbound == nil {
+		if g.fallbackFastest && selected != nil && g.isFallback(selected) && common.Contains(selected.Network(), network) {
+			tag := RealTag(g.outbound, selected)
+			if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
+				minOutbound, minDelay = selected, history.Delay
+			}
+		}
 		for _, detour := range g.fallbacks {
 			if !common.Contains(detour.Network(), network) {
 				continue
 			}
 			tag := RealTag(g.outbound, detour)
 			history := g.history.LoadURLTestHistory(tag)
-			if history == nil || (skip != nil && skip(tag, history)) {
+			if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 				continue
 			}
-			return detour, true
+			if !g.fallbackFastest {
+				return detour, true
+			}
+			if minOutbound == nil || uint32(minDelay) > uint32(history.Delay)+uint32(g.tolerance) {
+				minOutbound, minDelay = detour, history.Delay
+			}
+		}
+		if minOutbound != nil {
+			return minOutbound, true
 		}
 		// the plain choice: the first outbound for the network, or, without one, fallback
 		for _, detour := range g.members {
@@ -562,7 +599,7 @@ func (g *URLTestGroup) urlTestRound(ctx context.Context, force bool, wait bool) 
 			go g.CheckOutbounds(g.ctx, true)
 		}
 	}()
-	return URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait), nil
+	return urlTestOutbounds(ctx, g.outbound, g.history, g.logger, g.members, g.link, g.interval, force, wait, g), nil
 }
 
 type urlTestResult struct {
@@ -571,6 +608,7 @@ type urlTestResult struct {
 }
 
 type urlTestBatch struct {
+	owner    *URLTestGroup
 	ctx      context.Context
 	outbound adapter.OutboundManager
 	history  *urltest.HistoryStorage
@@ -589,8 +627,13 @@ type urlTestBatch struct {
 // choice. Without, the selection runs after the call returns: the Clash API answers its
 // client in time, while the selection may run a download test of up to 15 s per candidate.
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
+	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, wait, nil)
+}
+
+func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool, owner *URLTestGroup) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	testBatch := &urlTestBatch{
+		owner:    owner,
 		ctx:      ctx,
 		outbound: outboundManager,
 		history:  history,
@@ -653,7 +696,23 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
 				var testResult urlTestResult
+				started := time.Now()
 				testResult.delay, testResult.err = testOutbound(b.ctx, link, detour)
+				owner := b.owner
+				if owner != nil && owner.fallbackRecovery != nil {
+					if b.ctx.Err() != nil || owner.ctx.Err() != nil || owner.networkChangedSince(started) || (testResult.err != nil && owner.networkPaused()) {
+						return nil, nil
+					}
+					if testResult.err != nil && localNetworkError(testResult.err) {
+						owner.afterLocalFailure(tag, func() { owner.history.DeleteURLTestHistory(tag); owner.recoveryFailed(tag); owner.requestUpdateCheck() })
+						return nil, nil
+					}
+					if testResult.err != nil {
+						owner.recoveryFailed(tag)
+					} else {
+						owner.fallbackRecovery.answered(tag, time.Now(), owner.interval)
+					}
+				}
 				if testResult.err != nil {
 					if b.ctx.Err() != nil {
 						return nil, nil

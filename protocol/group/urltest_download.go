@@ -103,6 +103,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 		// ran (the round forced by a network change, which also cut this download) is a
 		// newer result and brings the member back
 		g.setFrozen(tag, start)
+		g.recoveryFailed(tag)
 		tried[tag] = true
 	}
 	if current != nil && g.history.LoadURLTestHistory(RealTag(g.outbound, current)) != nil {

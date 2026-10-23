@@ -46,6 +46,14 @@ before the group switches to it, as an outbound does.
 
 A fallback may not repeat a tag of `outbounds` or of `fallbacks`.
 
+#### fallback_selection
+
+Optional selection policy for `fallbacks`: `ordered` (the default) or `fastest`.
+With `fastest`, available fallbacks compete by delay using the group's tolerance;
+the current fallback stays within that tolerance. Available `outbounds` always
+take precedence. Failure, download checks and optional recovery confirmation
+apply to both policies. Omitting the option preserves ordered selection.
+
 #### url
 
 The URL to test. `https://www.gstatic.com/generate_204` will be used if empty.

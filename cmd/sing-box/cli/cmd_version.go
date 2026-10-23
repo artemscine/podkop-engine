@@ -81,4 +81,6 @@ var versionFeatures = []string{
 	"tools.decode-link",
 	// the uTLS fingerprint fallback (SING_BOX_UTLS_FALLBACK)
 	"tls.utls-fallback",
+	"urltest.fallback_recovery",
+	"urltest.fallback_selection",
 }
