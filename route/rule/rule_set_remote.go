@@ -130,22 +130,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if s.cacheFile != nil {
-		savedSet := s.cacheFile.LoadRuleSet(s.tag)
-		if savedSet != nil {
-			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
-				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
-			} else {
-				err = s.loadBytes(savedSet.Content)
-				if err != nil {
-					s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
-				} else {
-					s.lastUpdated = savedSet.LastUpdated
-					s.lastEtag = savedSet.LastEtag
-				}
-			}
-		}
-	}
+	s.loadCached()
 	var loadedFromInitialPath bool
 	if s.lastUpdated.IsZero() && s.initialPath != "" {
 		var content []byte
@@ -163,6 +148,34 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		s.startWithNothingLoaded(ctx)
 	}
 	return nil
+}
+
+// loadCached takes the content of the cache file, when there is one, made from the URL of
+// the set, and when it was last downloaded or found up to date.
+func (s *RemoteRuleSet) loadCached() {
+	if s.cacheFile == nil {
+		return
+	}
+	savedSet := s.cacheFile.LoadRuleSet(s.tag)
+	if savedSet != nil {
+		if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
+			s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
+		} else {
+			err := s.loadBytes(savedSet.Content)
+			if err != nil {
+				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+			} else {
+				s.lastUpdated = savedSet.LastUpdated
+				s.lastEtag = savedSet.LastEtag
+				// found up to date since the content was saved
+				if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
+					if checked := checks.LoadRuleSetChecked(s.tag); checked.After(s.lastUpdated) {
+						s.lastUpdated = checked
+					}
+				}
+			}
+		}
+	}
 }
 
 // startWithNothingLoaded starts a set that has neither a cached nor an initial content.
@@ -262,7 +275,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 }
 
 // commitBytes takes a new content without telling anyone: a download tells the callbacks
-// once the content is in the cache file too.
+// once the content is in the cache file too. A rule set closed meanwhile stops reading it:
+// the box that replaces this one reads its own, and two reads of a big list at once are
+// the most memory an apply takes.
 func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	var (
 		ruleSet option.PlainRuleSetCompat
@@ -270,18 +285,18 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	)
 	switch s.options.Format {
 	case C.RuleSetFormatSource:
-		ruleSet, err = domainset.ReadSource(content)
+		ruleSet, err = domainset.ReadSourceContext(s.ctx, content)
 		if err != nil {
 			return err
 		}
 	case C.RuleSetFormatBinary:
-		ruleSet, err = srs.ReadSets(bytes.NewReader(content))
+		ruleSet, err = srs.ReadSets(contextReader{s.ctx, bytes.NewReader(content)})
 		if err != nil {
 			return err
 		}
 	case C.RuleSetFormatText:
 		var skipped ruletext.Skipped
-		ruleSet, skipped, err = ruletext.Read(content)
+		ruleSet, skipped, err = ruletext.ReadContext(s.ctx, content)
 		if err != nil {
 			return err
 		}
@@ -297,6 +312,9 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	}
 	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
 	for i, ruleOptions := range plainRuleSet.Rules {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
 		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
 		if err != nil {
 			return E.Cause(err, "parse rule_set.rules.[", i, "]")
@@ -313,6 +331,20 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	s.contentUnknown = false
 	s.access.Unlock()
 	return nil
+}
+
+// contextReader ends with the error of ctx once it is done: a rule set of the binary
+// format closed while it is read stops at the next read.
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }
 
 // notifyUpdated runs the callbacks of a new content. A download calls it once the content
@@ -540,7 +572,15 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		s.lastUpdated = time.Now()
-		if s.cacheFile != nil {
+		if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
+			// the time alone: a save of the set writes the whole list again, at every
+			// update_interval, to a cache file that may be on flash
+			err = checks.StoreRuleSetChecked(s.tag, s.lastUpdated)
+			if err != nil {
+				s.logger.Error("save rule-set updated time: ", err)
+				return nil
+			}
+		} else if s.cacheFile != nil {
 			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
 			if savedRuleSet != nil {
 				savedRuleSet.LastUpdated = s.lastUpdated

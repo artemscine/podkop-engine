@@ -7,6 +7,7 @@ package ruletext
 
 import (
 	"bytes"
+	"context"
 	"net/netip"
 	"strings"
 
@@ -36,17 +37,26 @@ type Skipped struct {
 // The domains come as the trie of the rule (DomainSet), built by common/domainset from
 // where they are in the content: a name in lower case already is not copied.
 func Read(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
-	return read(content, true)
+	return read(context.Background(), content, true)
+}
+
+// ReadContext is Read that stops with the error of ctx once it is done: a rule set closed
+// while it reads a big list does not read it to the end.
+func ReadContext(ctx context.Context, content []byte) (option.PlainRuleSetCompat, Skipped, error) {
+	return read(ctx, content, true)
 }
 
 // ReadAddresses is Read without the matcher of the domains, for those who want the
 // addresses of the list and whether sing-box takes it: the domains are checked and
 // counted, not built.
 func ReadAddresses(content []byte) (option.PlainRuleSetCompat, Skipped, error) {
-	return read(content, false)
+	return read(context.Background(), content, false)
 }
 
-func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
+// stopEvery is how many lines go between two looks at the context: a mask.
+const stopEvery = 1<<12 - 1
+
+func read(ctx context.Context, content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error) {
 	var (
 		skipped Skipped
 		domains int
@@ -59,8 +69,11 @@ func read(content []byte, build bool) (option.PlainRuleSetCompat, Skipped, error
 		items        int
 		lines        = bytes.Count(content, []byte{'\n'}) + 1
 	)
-	names := domainset.NewCollector(content)
-	for offset := 0; offset < len(content); {
+	names := domainset.NewCollectorContext(ctx, content)
+	for offset, number := 0, 0; offset < len(content); number++ {
+		if number&stopEvery == 0 && ctx.Err() != nil {
+			return option.PlainRuleSetCompat{}, skipped, ctx.Err()
+		}
 		lineStart := offset
 		lineEnd := bytes.IndexByte(content[offset:], '\n')
 		if lineEnd < 0 {
