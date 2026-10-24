@@ -51,6 +51,8 @@ type Router struct {
 	rulesAccess           sync.RWMutex
 	started               bool
 	closing               bool
+	// providers are the provider's servers of the fallback of this box (podkop-engine)
+	providers *providerSet
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -63,7 +65,13 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		rawRules:              make([]option.DNSRule, 0, len(options.Rules)),
 		rules:                 make([]adapter.DNSRule, 0, len(options.Rules)),
 		defaultDomainStrategy: C.DomainStrategy(options.Strategy),
+		providers:             newProviderSet(),
 	}
+	// the transports of this box find the provider's servers of its fallback here
+	if service.RegistryFromContext(ctx) != nil {
+		service.MustRegister[*providerSet](ctx, router.providers)
+	}
+
 	if options.DNSClientOptions.IndependentCache {
 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
 	}
@@ -1399,7 +1407,9 @@ func (r *Router) ResetNetwork() {
 			state.reset()
 		}
 	}
-	ResetFallbackProviders() // the output device may have changed
+	if r.providers != nil {
+		r.providers.forget() // the output device may have changed
+	}
 }
 
 func defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule option.DefaultDNSRule) bool {
