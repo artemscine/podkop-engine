@@ -130,22 +130,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if s.cacheFile != nil {
-		savedSet := s.cacheFile.LoadRuleSet(s.tag)
-		if savedSet != nil {
-			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
-				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
-			} else {
-				err = s.loadBytes(savedSet.Content)
-				if err != nil {
-					s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
-				} else {
-					s.lastUpdated = savedSet.LastUpdated
-					s.lastEtag = savedSet.LastEtag
-				}
-			}
-		}
-	}
+	s.loadCached()
 	var loadedFromInitialPath bool
 	if s.lastUpdated.IsZero() && s.initialPath != "" {
 		var content []byte
@@ -163,6 +148,34 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		s.startWithNothingLoaded(ctx)
 	}
 	return nil
+}
+
+// loadCached takes the content of the cache file, when there is one, made from the URL of
+// the set, and when it was last downloaded or found up to date.
+func (s *RemoteRuleSet) loadCached() {
+	if s.cacheFile == nil {
+		return
+	}
+	savedSet := s.cacheFile.LoadRuleSet(s.tag)
+	if savedSet != nil {
+		if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
+			s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
+		} else {
+			err := s.loadBytes(savedSet.Content)
+			if err != nil {
+				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+			} else {
+				s.lastUpdated = savedSet.LastUpdated
+				s.lastEtag = savedSet.LastEtag
+				// found up to date since the content was saved
+				if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
+					if checked := checks.LoadRuleSetChecked(s.tag); checked.After(s.lastUpdated) {
+						s.lastUpdated = checked
+					}
+				}
+			}
+		}
+	}
 }
 
 // startWithNothingLoaded starts a set that has neither a cached nor an initial content.
@@ -559,7 +572,15 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		s.lastUpdated = time.Now()
-		if s.cacheFile != nil {
+		if checks, kept := s.cacheFile.(adapter.RuleSetCheckCache); kept {
+			// the time alone: a save of the set writes the whole list again, at every
+			// update_interval, to a cache file that may be on flash
+			err = checks.StoreRuleSetChecked(s.tag, s.lastUpdated)
+			if err != nil {
+				s.logger.Error("save rule-set updated time: ", err)
+				return nil
+			}
+		} else if s.cacheFile != nil {
 			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
 			if savedRuleSet != nil {
 				savedRuleSet.LastUpdated = s.lastUpdated
