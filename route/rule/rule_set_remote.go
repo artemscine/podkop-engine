@@ -262,7 +262,9 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 }
 
 // commitBytes takes a new content without telling anyone: a download tells the callbacks
-// once the content is in the cache file too.
+// once the content is in the cache file too. A rule set closed meanwhile stops reading it:
+// the box that replaces this one reads its own, and two reads of a big list at once are
+// the most memory an apply takes.
 func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	var (
 		ruleSet option.PlainRuleSetCompat
@@ -270,18 +272,18 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	)
 	switch s.options.Format {
 	case C.RuleSetFormatSource:
-		ruleSet, err = domainset.ReadSource(content)
+		ruleSet, err = domainset.ReadSourceContext(s.ctx, content)
 		if err != nil {
 			return err
 		}
 	case C.RuleSetFormatBinary:
-		ruleSet, err = srs.ReadSets(bytes.NewReader(content))
+		ruleSet, err = srs.ReadSets(contextReader{s.ctx, bytes.NewReader(content)})
 		if err != nil {
 			return err
 		}
 	case C.RuleSetFormatText:
 		var skipped ruletext.Skipped
-		ruleSet, skipped, err = ruletext.Read(content)
+		ruleSet, skipped, err = ruletext.ReadContext(s.ctx, content)
 		if err != nil {
 			return err
 		}
@@ -297,6 +299,9 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	}
 	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
 	for i, ruleOptions := range plainRuleSet.Rules {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
 		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
 		if err != nil {
 			return E.Cause(err, "parse rule_set.rules.[", i, "]")
@@ -313,6 +318,20 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	s.contentUnknown = false
 	s.access.Unlock()
 	return nil
+}
+
+// contextReader ends with the error of ctx once it is done: a rule set of the binary
+// format closed while it is read stops at the next read.
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }
 
 // notifyUpdated runs the callbacks of a new content. A download calls it once the content
