@@ -249,8 +249,14 @@ func (c *CacheFile) start() error {
 		db.Close()
 		return err
 	}
-	c.pruneRuleSetFiles(db)
 	c.DB = db
+	c.moveRuleSetsToFiles()
+	db, err = c.compactSparse(db)
+	if err != nil {
+		return err
+	}
+	c.DB = db
+	c.pruneRuleSetFiles(db)
 	return nil
 }
 

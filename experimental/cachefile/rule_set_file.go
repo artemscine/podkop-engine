@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing-box/adapter"
@@ -177,6 +178,86 @@ func (c *CacheFile) saveRuleSetFile(tag string, set *adapter.SavedBinary) error 
 		}
 		return nil
 	})
+}
+
+// moveRuleSetsToFiles moves the rule sets an earlier version kept in the database into
+// their files, one at a time; one that cannot be written stays where it is and is read
+// from there.
+func (c *CacheFile) moveRuleSetsToFiles() {
+	var tags []string
+	_ = c.view(func(t *bbolt.Tx) error {
+		bucket := c.bucket(t, bucketRuleSet)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(tag []byte, _ []byte) error {
+			tags = append(tags, string(tag))
+			return nil
+		})
+	})
+	for _, tag := range tags {
+		var saved adapter.SavedBinary
+		err := c.view(func(t *bbolt.Tx) error {
+			return saved.UnmarshalBinary(c.bucket(t, bucketRuleSet).Get([]byte(tag)))
+		})
+		if err != nil {
+			continue
+		}
+		err = c.saveRuleSetFile(tag, &saved)
+		if err != nil {
+			c.logger.Warn("rule-set cache ", tag, ": move it into its file: ", err)
+			return
+		}
+	}
+}
+
+// compactFrom is the size from which a cache file that is mostly free pages is written
+// anew: the lists an earlier version kept in it left it at three to four times their size,
+// and bbolt never gives a page back to the file system.
+const compactFrom = 8 << 20
+
+// compactSparse writes the database anew into a file of the size of what it holds when
+// more than half of a big file is free pages, and returns the database to use.
+func (c *CacheFile) compactSparse(db *bbolt.DB) (*bbolt.DB, error) {
+	info, err := os.Stat(c.path)
+	if err != nil || info.Size() < compactFrom {
+		return db, nil
+	}
+	stats := db.Stats()
+	free := int64(stats.FreePageN+stats.PendingPageN) * int64(db.Info().PageSize)
+	if free*2 < info.Size() {
+		return db, nil
+	}
+	compact := c.path + ".compact"
+	_ = os.Remove(compact)
+	destination, err := bbolt.Open(compact, 0o666, &bbolt.Options{Timeout: time.Second})
+	if err != nil {
+		return db, nil
+	}
+	err = bbolt.Compact(destination, db, 4<<20)
+	closeErr := destination.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(compact)
+		c.logger.Warn("compact the cache file: ", err)
+		return db, nil
+	}
+	db.Close()
+	err = os.Rename(compact, c.path)
+	if err != nil {
+		_ = os.Remove(compact)
+	}
+	db, openErr := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
+	if openErr != nil {
+		return nil, openErr
+	}
+	if err == nil {
+		c.logger.Info("cache file compacted: ", info.Size()>>20, " MiB, most of it free pages")
+		_ = filemanager.Chown(c.ctx, c.path)
+	}
+	return db, nil
 }
 
 // pruneRuleSetFiles removes the files of the directory that no record names (of any cache
