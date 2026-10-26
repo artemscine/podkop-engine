@@ -1,11 +1,13 @@
 package route
 
 import (
+	"io"
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +18,10 @@ type fakeOutbound struct {
 }
 
 func (o fakeOutbound) Type() string { return o.typ }
+func (o fakeOutbound) Tag() string  { return o.typ }
+func (o fakeOutbound) Network() []string {
+	return []string{N.NetworkTCP, N.NetworkUDP}
+}
 
 type fakeListenInbound struct {
 	adapter.Inbound
@@ -26,11 +32,12 @@ func (i fakeListenInbound) ListenAddress() M.Socksaddr { return i.addr }
 
 type fakeGroup struct {
 	fakeOutbound
-	now string
+	member adapter.Outbound
 }
 
-func (g fakeGroup) Now() string   { return g.now }
-func (g fakeGroup) All() []string { return []string{g.now} }
+func (g fakeGroup) All() []string                              { return nil }
+func (g fakeGroup) Selected(string) adapter.Outbound           { return g.member }
+func (g fakeGroup) AttachConnection(io.Closer) (detach func()) { return func() {} }
 
 type fakeOutboundManager struct {
 	adapter.OutboundManager
@@ -92,26 +99,29 @@ func TestWouldLoopToInbound(t *testing.T) {
 	require.False(t, r.wouldLoopToInbound(mk("gone", dnsIn), direct))
 }
 
-// A group dials through its selected member: a selector or urltest whose current member is
-// the direct outbound forms the same loop; one whose member is a proxy does not.
+// A group dials through its selected member, which the router resolves before the check
+// (the last outbound of the chain): a selector or urltest whose current member is the direct
+// outbound forms the same loop; one whose member is a proxy does not.
 func TestWouldLoopToInboundThroughGroup(t *testing.T) {
 	t.Parallel()
 	dnsIn := M.ParseSocksaddr("127.0.0.42:53")
 	direct := fakeOutbound{typ: C.TypeDirect}
 	socks := fakeOutbound{typ: C.TypeSOCKS}
 	r := &Router{
-		inbound: fakeInboundManager{inbounds: map[string]adapter.Inbound{"dns-in": fakeListenInbound{addr: dnsIn}}},
-		outbound: fakeOutboundManager{outbounds: map[string]adapter.Outbound{
-			"direct":    direct,
-			"socks":     socks,
-			"to-direct": fakeGroup{fakeOutbound{typ: C.TypeSelector}, "direct"},
-		}},
+		inbound:  fakeInboundManager{inbounds: map[string]adapter.Inbound{"dns-in": fakeListenInbound{addr: dnsIn}}},
+		outbound: fakeOutboundManager{outbounds: map[string]adapter.Outbound{"direct": direct, "socks": socks}},
 	}
 	metadata := &adapter.InboundContext{Inbound: "dns-in", Destination: dnsIn}
-	require.True(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeURLTest}, "direct"}))
-	require.True(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeSelector}, "to-direct"}), "a group inside a group")
-	require.False(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeURLTest}, "socks"}))
-	require.False(t, r.wouldLoopToInbound(metadata, fakeGroup{fakeOutbound{typ: C.TypeURLTest}, "missing"}), "a member that is gone")
+	last := func(outbound adapter.Outbound) adapter.Outbound {
+		chain, err := resolveOutbound(outbound, N.NetworkTCP)
+		require.NoError(t, err)
+		return chain[len(chain)-1]
+	}
+	require.True(t, r.wouldLoopToInbound(metadata, last(fakeGroup{fakeOutbound{typ: C.TypeURLTest}, direct})))
+	require.True(t, r.wouldLoopToInbound(metadata, last(fakeGroup{fakeOutbound{typ: C.TypeSelector}, fakeGroup{fakeOutbound{typ: C.TypeSelector}, direct}})), "a group inside a group")
+	require.False(t, r.wouldLoopToInbound(metadata, last(fakeGroup{fakeOutbound{typ: C.TypeURLTest}, socks})))
+	_, err := resolveOutbound(fakeGroup{fakeOutbound{typ: C.TypeURLTest}, nil}, N.NetworkTCP)
+	require.Error(t, err, "a group without a member is refused before the check")
 }
 
 // A listener on every address (0.0.0.0, ::) is reached at whichever address the connection

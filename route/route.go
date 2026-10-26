@@ -661,21 +661,12 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 // direct outbound dials the raw destination, and only a return to the SAME inbound is a
 // loop: a connection chained to a different local inbound (a urltest member pointed at a
 // mixed inbound) goes through a proxy outbound to another inbound and is left alone.
+//
+// selectedOutbound is the outbound the connection is dialed through: the last of the chain
+// the router resolved, a group's selected member.
 func (r *Router) wouldLoopToInbound(metadata *adapter.InboundContext, selectedOutbound adapter.Outbound) bool {
 	if metadata.Inbound == "" {
 		return false
-	}
-	// a group dials through the member it has selected
-	for range 8 {
-		group, isGroup := selectedOutbound.(adapter.OutboundGroup)
-		if !isGroup {
-			break
-		}
-		member, loaded := r.outbound.Outbound(group.Now())
-		if !loaded {
-			return false
-		}
-		selectedOutbound = member
 	}
 	if selectedOutbound.Type() != C.TypeDirect {
 		return false

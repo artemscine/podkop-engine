@@ -173,7 +173,7 @@ func (g *URLTestGroup) networkPaused() bool {
 	}
 	reported := g.epoch.Add(time.Duration(g.networkPauseAt.Load()))
 	for _, member := range g.members {
-		history := g.history.LoadURLTestHistory(RealTag(g.outbound, member))
+		history := g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP))
 		if history != nil && history.Time.After(reported) {
 			return false
 		}
@@ -227,7 +227,7 @@ func (g *URLTestGroup) probeUnseenNetwork() {
 		return
 	}
 	for _, member := range g.members {
-		if g.history.LoadURLTestHistory(RealTag(g.outbound, member)) != nil {
+		if g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP)) != nil {
 			return
 		}
 	}

@@ -82,7 +82,7 @@ func TestRequestContextReachesDialer(t *testing.T) {
 			require.NoError(t, err, testCase.name)
 			ctx := context.Background()
 			if marked {
-				ctx = interrupt.ContextWithIsExternalConnection(ctx)
+				ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 			}
 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, testCase.link, nil)
 			require.NoError(t, err, testCase.name)

@@ -20,7 +20,7 @@ func (t *recordTracker) Close() error               { return nil }
 // writes its time into the copy it keeps and not into that record. With the race detector
 // this test is the race itself.
 func TestLeaveDoesNotWriteTheRecordBeingRead(t *testing.T) {
-	manager := NewManager(nil)
+	manager := NewManager()
 	var read int64
 	for range 100 {
 		tracker := &recordTracker{metadata: TrackerMetadata{ID: uuid.Must(uuid.NewV4()), Upload: new(atomic.Int64), Download: new(atomic.Int64)}}

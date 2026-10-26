@@ -475,7 +475,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 			if !common.Contains(detour.Network(), network) {
 				continue
 			}
-			tag := RealTag(g.outbound, detour)
+			tag := RealTag(detour, network)
 			history := g.history.LoadURLTestHistory(tag)
 			if history == nil || (skip != nil && skip(tag, history)) {
 				continue
