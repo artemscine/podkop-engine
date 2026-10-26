@@ -68,6 +68,8 @@ type RemoteRuleSet struct {
 	fetchLoaded   bool
 	failures      int
 	failureLogged time.Time
+	// the size of the list it holds: big lists are updated one at a time (heavyRuleSetSize)
+	contentSize atomic.Int64
 }
 
 func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
@@ -330,6 +332,7 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	s.rules = rules
 	s.contentUnknown = false
 	s.access.Unlock()
+	s.contentSize.Store(int64(len(content)))
 	return nil
 }
 

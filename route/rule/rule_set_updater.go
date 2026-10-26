@@ -1,8 +1,10 @@
 package rule
 
 import (
+	"cmp"
 	"context"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -155,11 +157,27 @@ type updateResult struct {
 	failed bool
 }
 
-// updateAll updates the rule-sets of the indexes, ruleSetUpdateConcurrency at a time, and
-// returns what each came to, by index. A rule-set is touched by one goroutine only.
+// heavyRuleSetSize is the size of a list from which its update waits for the update of
+// any other such list (podkop-engine): the download holds the list, the parse builds the
+// next one beside the one in use, and the save writes it; big lists updated together took
+// all of that at once. Small lists, and those that hold nothing yet, go together as before.
+const heavyRuleSetSize = 1 << 20
+
+// updateAll updates the rule-sets of the indexes, ruleSetUpdateConcurrency at a time and
+// the big ones one at a time, and returns what each came to, by index. A rule-set is
+// touched by one goroutine only.
 func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
 	results := make([]updateResult, len(u.ruleSets))
 	slots := make(chan struct{}, ruleSetUpdateConcurrency)
+	heavy := make(chan struct{}, 1)
+	isHeavy := func(i int) bool {
+		return u.ruleSets[i].contentSize.Load() >= heavyRuleSetSize
+	}
+	// the small ones first: big ones waiting for each other hold slots meanwhile
+	indexes = slices.Clone(indexes)
+	slices.SortStableFunc(indexes, func(left int, right int) int {
+		return cmp.Compare(boolOrder(isHeavy(left)), boolOrder(isHeavy(right)))
+	})
 	var group sync.WaitGroup
 	for _, i := range indexes {
 		group.Add(1)
@@ -167,6 +185,10 @@ func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
 		go func(i int) {
 			defer group.Done()
 			defer func() { <-slots }()
+			if isHeavy(i) {
+				heavy <- struct{}{}
+				defer func() { <-heavy }()
+			}
 			ruleSet := u.ruleSets[i]
 			failures := ruleSet.failures
 			results[i].loaded = ruleSet.updateOnce()
@@ -175,6 +197,13 @@ func (u *RuleSetUpdater) updateAll(indexes []int) []updateResult {
 	}
 	group.Wait()
 	return results
+}
+
+func boolOrder(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func waitUntilNext(nextUpdates []time.Time) time.Duration {
