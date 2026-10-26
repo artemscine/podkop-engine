@@ -28,7 +28,10 @@ import (
 	"golang.org/x/net/http2"
 )
 
-var _ adapter.V2RayClientTransport = (*Client)(nil)
+var (
+	_ adapter.V2RayClientTransport = (*Client)(nil)
+	_ adapter.IdleConnectionKeeper = (*Client)(nil)
+)
 
 type Client struct {
 	mode string
@@ -331,6 +334,24 @@ func (c *Client) sessionClients(s *session) (*poolClient, *poolClient, error) {
 // with it. (sing-box cancels the context before it closes the outbounds.)
 // Closed while the context lives, the client holds nothing but the idle
 // timers of the connections dialed afterwards.
+// SetKeepIdleConnections and CloseIdleConnections make the transport an
+// adapter.IdleConnectionKeeper, as the other transports of sing-box 1.14 are: the
+// idle connections of an outbound nothing references any more (a member of a
+// urltest group that is not selected) are closed instead of waiting out the idle
+// timeout of the pool. The connections of sessions stay.
+func (c *Client) SetKeepIdleConnections(keep bool) {
+	if !keep {
+		c.CloseIdleConnections()
+	}
+}
+
+func (c *Client) CloseIdleConnections() {
+	c.upPool.closeIdle()
+	if c.downPool != nil && c.downPool != c.upPool {
+		c.downPool.closeIdle()
+	}
+}
+
 func (c *Client) Close() error {
 	c.upPool.close()
 	if c.downPool != c.upPool {

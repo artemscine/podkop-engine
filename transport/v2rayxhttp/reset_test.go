@@ -317,3 +317,40 @@ func TestXHTTPResetRefusesRequestsOfClosedClients(t *testing.T) {
 	p.access.Unlock()
 	require.Zero(t, failures)
 }
+
+// closingConnection counts the times it is closed.
+type closingConnection struct {
+	countingConnection
+	closed atomic.Int32
+}
+
+func (c *closingConnection) close() { c.closed.Add(1) }
+
+// The idle connections of the pool are closed on request (an outbound nothing references
+// any more), those a session uses stay, and the pool opens a new one for the next session.
+func TestXHTTPCloseIdleConnections(t *testing.T) {
+	var connections []*closingConnection
+	p := newPool(context.Background(), xmuxConfig{}, func() pooledConnection {
+		connection := new(closingConnection)
+		connections = append(connections, connection)
+		return connection
+	})
+	defer p.close()
+	idle, err := p.get(true)
+	require.NoError(t, err)
+	idle.endSession()
+	idle.release()
+	p.closeIdle()
+	require.Len(t, connections, 1)
+	require.EqualValues(t, 1, connections[0].closed.Load(), "the idle connection stays open")
+
+	busy, err := p.get(true)
+	require.NoError(t, err)
+	require.Len(t, connections, 2, "no new connection after the idle one was closed")
+	p.closeIdle()
+	require.Zero(t, connections[1].closed.Load(), "the connection of a session was closed")
+	busy.endSession()
+	busy.release()
+	p.closeIdle()
+	require.EqualValues(t, 1, connections[1].closed.Load())
+}
