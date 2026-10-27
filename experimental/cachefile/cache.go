@@ -251,7 +251,8 @@ func (c *CacheFile) start() error {
 	}
 	c.DB = db
 	c.moveRuleSetsToFiles()
-	db, err = c.compactSparse(db)
+	// the move may have reset the database (a damaged page found on the way): the one it left
+	db, err = c.compactSparse(c.DB)
 	if err != nil {
 		return err
 	}
