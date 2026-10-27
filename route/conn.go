@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -281,13 +280,10 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 }
 
+// deleteURLTestHistory is left to the URL test group: a connection of a chain with one is
+// dialed through it (dialTarget), and it judges the failures of its members itself, a failure of
+// the destination or of the network of the router not taken for one of the member.
 func (m *ConnectionManager) deleteURLTestHistory(chain []adapter.Outbound) {
-	if slices.ContainsFunc(chain, func(it adapter.Outbound) bool {
-		_, isURLTestGroup := it.(adapter.URLTestGroup)
-		return isURLTestGroup
-	}) {
-		m.urlTestHistory.DeleteURLTestHistory(chain[len(chain)-1].Tag())
-	}
 }
 
 func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {

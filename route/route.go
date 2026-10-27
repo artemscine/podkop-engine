@@ -173,7 +173,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	onClose = registerInterrupt(chain, conn, onClose)
-	outbound := chain[len(chain)-1]
+	outbound := dialTarget(chain)
 	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
@@ -199,6 +199,20 @@ func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbo
 		return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", outbound.Tag())
 	}
 	return chain, nil
+}
+
+// dialTarget is the outbound of a chain a routed connection is dialed through: the first URL
+// test group of the chain, else the last outbound. The URL test of podkop-engine judges the
+// dials of its members itself (a member that fails or does not answer is tested out of turn and
+// left at once, a fallback taken, a member whose test is pending not used): a dial of the member
+// past the group, as sing-box 1.14.4 makes it, would leave all of that out.
+func dialTarget(chain []adapter.Outbound) adapter.Outbound {
+	for _, outbound := range chain {
+		if _, isURLTestGroup := outbound.(adapter.URLTestGroup); isURLTestGroup {
+			return outbound
+		}
+	}
+	return chain[len(chain)-1]
 }
 
 func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
@@ -349,7 +363,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	onClose = registerInterrupt(chain, conn, onClose)
-	outbound := chain[len(chain)-1]
+	outbound := dialTarget(chain)
 	if outboundHandler, isHandler := outbound.(adapter.PacketConnectionHandler); isHandler {
 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
 	} else {
