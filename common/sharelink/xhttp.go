@@ -66,6 +66,7 @@ type xrayXmux struct {
 }
 
 type xrayStream struct {
+	FinalMask         json.RawMessage `json:"finalmask"`
 	Address           string          `json:"address"`
 	Port              uint16          `json:"port"`
 	Network           string          `json:"network"`
@@ -131,7 +132,7 @@ func (d *decoder) readObject(name string, content []byte, target any) (map[strin
 	known := make(map[string]bool)
 	targetType := reflect.TypeOf(target).Elem()
 	for i := 0; i < targetType.NumField(); i++ {
-		known[strings.ToLower(targetType.Field(i).Tag.Get("json"))] = true
+		known[strings.ToLower(strings.SplitN(targetType.Field(i).Tag.Get("json"), ",", 2)[0])] = true
 	}
 	var unknown []string
 	for key := range keys {
@@ -464,6 +465,9 @@ func (d *decoder) xhttpDownload(content []byte) (*option.V2RayXHTTPDownloadOptio
 		}
 	default:
 		return nil, E.New(name, ": unsupported security", shown(stream.Security))
+	}
+	if err := d.applyFinalMask(name+".finalmask", stream.FinalMask, options.TLS); err != nil {
+		return nil, err
 	}
 	content = stream.XHTTPSettings
 	if len(content) == 0 || string(content) == "null" {

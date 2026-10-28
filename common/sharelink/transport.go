@@ -8,7 +8,6 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
@@ -16,11 +15,6 @@ import (
 // initialization of flatKeys: they are read only with that transport, and get
 // no warning with another.
 var knownKeys = make(map[string]bool)
-
-// The masks of Xray's finalmask ("fm") that are the client's own business: the server
-// is reached without them. Every other one changes what goes over the wire, and the
-// server expects it.
-var localMasks = map[string]bool{"fragment": true, "noise": true}
 
 // clientSide warns of the settings of Xray's client that a panel writes into a link: how
 // it fragments and pads its own packets. The server is reached without them.
@@ -34,33 +28,10 @@ func (d *decoder) clientSide() {
 	}
 }
 
-// finalMask reads "fm", the finalmask object of Xray.
-func (d *decoder) finalMask() error {
+// finalMask reads the client-side masks carried by a panel's VLESS link.
+func (d *decoder) finalMask(tlsOptions *option.OutboundTLSOptions) error {
 	d.reads("fm")
-	content := strings.TrimSpace(d.query["fm"])
-	if content == "" {
-		return nil
-	}
-	var mask struct {
-		TCP []struct {
-			Type string `json:"type"`
-		} `json:"tcp"`
-		UDP []struct {
-			Type string `json:"type"`
-		} `json:"udp"`
-	}
-	err := json.Unmarshal([]byte(content), &mask)
-	if err != nil {
-		d.warn("fm (finalmask) is not supported and cannot be read, the connection may not work")
-		return nil
-	}
-	for _, entry := range append(mask.TCP, mask.UDP...) {
-		if !localMasks[strings.ToLower(entry.Type)] {
-			return refuse("finalmask", "fm (finalmask) asks for the mask", shown(entry.Type), ", which is not supported: the server expects it")
-		}
-	}
-	d.warn("fm (finalmask) is not supported and is ignored: what it sets is the client's own")
-	return nil
+	return d.applyFinalMask("fm", []byte(strings.TrimSpace(d.query["fm"])), tlsOptions)
 }
 
 // ownALPN leaves the ALPN to a transport that speaks one protocol. Xray asks for
@@ -89,7 +60,7 @@ func (d *decoder) transport(tlsOptions *option.OutboundTLSOptions) (*option.V2Ra
 			d.warn("Xray does not serve REALITY over this transport")
 		}
 	}
-	err := d.finalMask()
+	err := d.finalMask(tlsOptions)
 	if err != nil {
 		return nil, err
 	}

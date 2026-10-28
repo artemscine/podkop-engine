@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/finalmask"
 	"github.com/sagernet/sing-box/common/tlsfragment"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
@@ -37,6 +38,7 @@ type UTLSClientConfig struct {
 	fragment              bool
 	fragmentFallbackDelay time.Duration
 	recordFragment        bool
+	finalMask             *finalmask.Config
 	spoof                 string
 	spoofMethod           tlsspoof.Method
 	// the fingerprint fallback, shared with the clones; nil when off
@@ -87,6 +89,7 @@ func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 }
 
 func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+	conn = c.finalMask.WrapConn(c.ctx, conn)
 	if c.fragment || c.recordFragment {
 		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
 	}
@@ -117,6 +120,7 @@ func (c *UTLSClientConfig) Clone() Config {
 		fragment:              c.fragment,
 		fragmentFallbackDelay: c.fragmentFallbackDelay,
 		recordFragment:        c.recordFragment,
+		finalMask:             c.finalMask,
 		spoof:                 c.spoof,
 		spoofMethod:           c.spoofMethod,
 		fallback:              c.fallback,
@@ -343,6 +347,10 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	} else {
 		handshakeTimeout = C.TCPTimeout
 	}
+	finalMask, err := parseFinalMaskOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	spoof, spoofMethod, err := parseTLSSpoofOptions(serverName, options)
 	if err != nil {
 		return nil, err
@@ -362,6 +370,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		fragment:              options.Fragment,
 		fragmentFallbackDelay: time.Duration(options.FragmentFallbackDelay),
 		recordFragment:        options.RecordFragment,
+		finalMask:             finalMask,
 		spoof:                 spoof,
 		spoofMethod:           spoofMethod,
 		fallback:              newUTLSFallback(ctx, logger, options.UTLS.Fingerprint, id, options.Reality != nil && options.Reality.Enabled, spoof != ""),

@@ -6,11 +6,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"slices"
+
+	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // quicSTDConfig carries over what NewUTLSClient sets for verifying the server;
 // a field added there that takes part in the verification must be added here.
 func (c *UTLSClientConfig) quicSTDConfig() (*STDConfig, error) {
+	if c.finalMask != nil {
+		return nil, E.New("TCP finalmask is unsupported over QUIC")
+	}
 	config := c.config
 	stdConfig := &tls.Config{
 		Time:                           config.Time,

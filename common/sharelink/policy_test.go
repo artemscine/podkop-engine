@@ -176,8 +176,8 @@ func TestLeniencies(t *testing.T) {
 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `","tls":{"enabled":true,"alpn":["h3","h2","http/1.1"]},"transport":{"type":"quic"}}`,
 			nil,
 		},
-		"finalmask of the client's own": {
-			policyBase + "fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%7D%5D%2C%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%2C%22quicParams%22%3A%7B%7D%7D",
+		"finalmask noise of the client's own": {
+			policyBase + "fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%2C%22quicParams%22%3A%7B%7D%7D",
 			`{"type":"vless","server":"example.org","server_port":443,"uuid":"` + testUUID + `"}`,
 			[]string{"fm (finalmask) is not supported and is ignored"},
 		},

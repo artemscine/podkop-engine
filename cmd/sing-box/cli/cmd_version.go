@@ -81,6 +81,8 @@ var versionFeatures = []string{
 	"tools.decode-link",
 	// the uTLS fingerprint fallback (SING_BOX_UTLS_FALLBACK)
 	"tls.utls-fallback",
+	// Xray-compatible client TCP fragment masks from the fm link parameter
+	"tls.finalmask.fragment",
 	"urltest.fallback_recovery",
 	"urltest.fallback_selection",
 }

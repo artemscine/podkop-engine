@@ -176,6 +176,9 @@ func Decode(link string) (*Outbound, []string, error) {
 // their own and the ones that name options by their paths: both can set a flow, a
 // transport or TLS.
 func consistent(outboundType string, options *object) error {
+	if err := consistentFinalMask(outboundType, options); err != nil {
+		return err
+	}
 	if spoof, _ := options.at("tls.spoof"); spoof != nil && spoof != "" {
 		// the forged ClientHello is sent on an established connection, before the real
 		// one; with TCP Fast Open the real one leaves with the connection attempt

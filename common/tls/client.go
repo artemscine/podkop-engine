@@ -92,6 +92,9 @@ type ClientOptions struct {
 }
 
 func NewClientWithOptions(options ClientOptions) (Config, error) {
+	if !options.Options.Enabled && options.Options.FinalMask != nil && len(options.Options.FinalMask.TCP) > 0 {
+		return nil, E.New("finalmask requires enabled TLS or REALITY")
+	}
 	if !options.Options.Enabled {
 		return nil, nil
 	}

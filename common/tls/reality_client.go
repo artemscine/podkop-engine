@@ -208,6 +208,11 @@ func (e *RealityClientConfig) Client(conn net.Conn) (Conn, error) {
 }
 
 func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
+	// Fragmentation can include application writes after the TLS handshake.
+	// Its lifetime is the outbound's, not the temporary handshake timeout:
+	// aTLS.ClientHandshake cancels that context as soon as it returns. uTLS
+	// closes this wrapper itself if the handshake context expires in flight.
+	conn = e.uClient.finalMask.WrapConn(e.ctx, conn)
 	verifier := &realityVerifier{
 		serverName: e.uClient.ServerName(),
 	}
