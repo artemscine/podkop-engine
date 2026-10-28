@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/compatible"
+	"github.com/sagernet/sing-box/common/interrupt"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -51,6 +52,7 @@ type Client struct {
 	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
 	failures          failureLog
+	ipv6IfNoIPv4      bool
 }
 
 type ClientOptions struct {
@@ -64,6 +66,7 @@ type ClientOptions struct {
 	RDRC              func() adapter.RDRCStore
 	DNSCache          func() adapter.DNSCacheStore
 	Logger            logger.ContextLogger
+	IPv6IfNoIPv4      bool
 }
 
 func NewClient(options ClientOptions) *Client {
@@ -79,6 +82,7 @@ func NewClient(options ClientOptions) *Client {
 		initRDRCFunc:      options.RDRC,
 		initDNSCacheFunc:  options.DNSCache,
 		logger:            options.Logger,
+		ipv6IfNoIPv4:      options.IPv6IfNoIPv4,
 	}
 	if client.timeout == 0 {
 		client.timeout = C.DNSTimeout
@@ -306,19 +310,22 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		}
 		for {
 			response, ttl, isStale := c.loadResponse(cacheKey)
-			if response != nil {
-				if isStale && !options.DisableOptimisticCache {
+			if response != nil && (!isStale || !options.DisableOptimisticCache) {
+				operation.release()
+				if isStale {
 					c.backgroundRefreshDNS(transport, cacheKey, message.Copy(), options, responseChecker)
-					logOptimisticResponse(c.logger, ctx, response)
-					response.Id = message.Id
-					operation.release()
-					return nil, response, exchangeDone, nil
-				} else if !isStale {
-					logCachedResponse(c.logger, ctx, response, ttl)
-					response.Id = message.Id
-					operation.release()
-					return nil, response, exchangeDone, nil
 				}
+				if responseChecker != nil && !responseChecker(response) {
+					logRejectedResponse(c.logger, ctx, response)
+					return nil, nil, exchangeDone, ErrResponseRejectedCached
+				}
+				if isStale {
+					logOptimisticResponse(c.logger, ctx, response)
+				} else {
+					logCachedResponse(c.logger, ctx, response, ttl)
+				}
+				response.Id = message.Id
+				return nil, response, exchangeDone, nil
 			}
 			if !loaded {
 				break
@@ -346,7 +353,7 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		operation.release()
 		return nil, nil, exchangeDone, E.New("DNS query loopback in transport[", contextTransport, "]")
 	}
-	operation.ctx = adapter.ContextWithDNSTransportTag(ctx, transport.Tag())
+	operation.ctx = adapter.ContextWithDNSTransportTag(interrupt.ContextWithIsExternalConnection(ctx, false), transport.Tag())
 	if !disableCache && responseChecker != nil && c.rdrc != nil {
 		rejected := c.rdrc.LoadRDRC(transport.Tag(), question.Name, question.Qtype)
 		if rejected {
@@ -399,6 +406,13 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 }
 
 func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
+	if c.mayAskIPv6(transport, message, options) && c.noIPv4(ctx, transport, message, options, responseChecker) {
+		options.Strategy = C.DomainStrategyPreferIPv4
+	}
+	return c.exchange(ctx, transport, message, options, responseChecker)
+}
+
+func (c *Client) exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
 	if options.Timeout == 0 {
 		options.Timeout = c.timeout
 	}
@@ -417,6 +431,16 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 }
 
 func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, callback func(response *dns.Msg, err error)) {
+	if c.mayAskIPv6(transport, message, options) {
+		// the A question may have to go out: not on the caller's goroutine
+		go func() {
+			if c.noIPv4(ctx, transport, message, options, responseChecker) {
+				options.Strategy = C.DomainStrategyPreferIPv4
+			}
+			callback(c.exchange(ctx, transport, message, options, responseChecker))
+		}()
+		return
+	}
 	if options.Timeout == 0 {
 		options.Timeout = c.timeout
 	}
@@ -464,7 +488,11 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	}
 	switch strategy {
 	case C.DomainStrategyIPv4Only:
-		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
+		addresses, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
+		if err == nil && len(addresses) == 0 && c.ipv6IfNoIPv4 && transport.Type() != C.DNSTypeFakeIP {
+			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
+		}
+		return addresses, err
 	case C.DomainStrategyIPv6Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 	}
@@ -577,6 +605,12 @@ func (c *Client) questionCache(ctx context.Context, transport adapter.DNSTranspo
 			return nil, ErrNotCached
 		}
 		c.backgroundRefreshDNS(transport, cacheKey, c.prepareExchangeMessage(message.Copy(), options), options, responseChecker)
+	}
+	if responseChecker != nil && !responseChecker(response) {
+		logRejectedResponse(c.logger, ctx, response)
+		return nil, ErrResponseRejectedCached
+	}
+	if isStale {
 		logOptimisticResponse(c.logger, ctx, response)
 	}
 	if response.Rcode != dns.RcodeSuccess {

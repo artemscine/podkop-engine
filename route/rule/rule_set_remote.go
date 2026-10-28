@@ -68,6 +68,8 @@ type RemoteRuleSet struct {
 	fetchLoaded   bool
 	failures      int
 	failureLogged time.Time
+	// the size of the list it holds: big lists are updated one at a time (heavyRuleSetSize)
+	contentSize atomic.Int64
 }
 
 func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
@@ -330,6 +332,7 @@ func (s *RemoteRuleSet) commitBytes(content []byte) error {
 	s.rules = rules
 	s.contentUnknown = false
 	s.access.Unlock()
+	s.contentSize.Store(int64(len(content)))
 	return nil
 }
 
@@ -521,7 +524,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
 	// a group that switches members closes the connections it does not know as routed
 	// ones: a list half downloaded through it would wait for the next update_interval
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
+	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if isStart {

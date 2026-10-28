@@ -119,7 +119,7 @@ func (g *URLTestGroup) watchResponse(conn net.Conn, member adapter.Outbound, des
 	if !watchResponses(member) {
 		return conn
 	}
-	tag := RealTag(g.outbound, member)
+	tag := RealTag(member, N.NetworkTCP)
 	if g.history.LoadURLTestHistory(tag) == nil {
 		return conn
 	}
@@ -417,7 +417,7 @@ func (g *URLTestGroup) closeUnanswered() {
 	var unanswered []*responseConn
 	g.responses.Range(func(key, value any) bool {
 		tag := key.(string)
-		if g.history.LoadURLTestHistory(tag) != nil || (selected != nil && RealTag(g.outbound, selected) == tag) {
+		if g.history.LoadURLTestHistory(tag) != nil || (selected != nil && RealTag(selected, N.NetworkTCP) == tag) {
 			return true
 		}
 		responses := value.(*memberResponses)

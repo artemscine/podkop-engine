@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync/atomic"
 	"syscall"
@@ -284,18 +285,19 @@ func TestURLTestFallbackClosesUnanswered(t *testing.T) {
 // testGroup is a group member that is a group itself, with the member now in use.
 type testGroup struct {
 	*testMember
-	now string
+	member adapter.Outbound
 }
 
-func (g *testGroup) Now() string   { return g.now }
-func (g *testGroup) All() []string { return []string{g.now} }
+func (g *testGroup) All() []string                              { return []string{g.member.Tag()} }
+func (g *testGroup) Selected(string) adapter.Outbound           { return g.member }
+func (g *testGroup) AttachConnection(io.Closer) (detach func()) { return func() {} }
 
 // A fallback that is a group is judged by the member it uses, and tested through it.
 func TestURLTestFallbackNestedGroup(t *testing.T) {
 	link, requests := testURL(t, 0)
 	a := newTestMember(C.TypeVLESS, "a", dialRefused)
 	inner := newTestMember(C.TypeSOCKS, "inner", dialWorking)
-	selector := &testGroup{testMember: newTestMember(C.TypeSelector, "selector", inner.dial), now: "inner"}
+	selector := &testGroup{testMember: newTestMember(C.TypeSelector, "selector", inner.dial), member: inner}
 	_, group := newTestFallbackGroup(t, link, "", members(a), []adapter.Outbound{selector}, map[string]uint16{"inner": 10})
 	group.outbound.(*testOutboundManager).members["inner"] = inner
 	group.performUpdateCheck()
@@ -310,7 +312,7 @@ func TestURLTestFallbackNestedGroup(t *testing.T) {
 }
 
 // The options: All and the dependencies list the outbounds, then the fallbacks; a tag
-// listed twice with fallbacks is an error, the outbounds alone are taken as before.
+// listed twice is an error.
 func TestURLTestFallbackOptions(t *testing.T) {
 	newGroup := func(outbounds, fallbacks []string) (*URLTest, error) {
 		created, err := NewURLTest(context.Background(), nil, log.NewNOPFactory().NewLogger("urltest"), "auto", option.URLTestOutboundOptions{
@@ -342,8 +344,9 @@ func TestURLTestFallbackOptions(t *testing.T) {
 	require.Error(t, err)
 	_, err = newGroup(nil, []string{"f"})
 	require.Error(t, err)
+	// sing-box 1.14.4 refuses a tag listed twice in the outbounds too
 	_, err = newGroup([]string{"a", "a"}, nil)
-	require.NoError(t, err)
+	require.Error(t, err)
 }
 
 // Start resolves the fallbacks; a missing one is an error.

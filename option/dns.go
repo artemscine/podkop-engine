@@ -68,6 +68,10 @@ type DNSClientOptions struct {
 	CacheCapacity    uint32                `json:"cache_capacity,omitempty"`
 	Optimistic       *OptimisticDNSOptions `json:"optimistic,omitempty"`
 	ClientSubnet     *badoption.Prefixable `json:"client_subnet,omitempty"`
+	// podkop-engine: with the strategy ipv4_only, the AAAA question of a name that has no
+	// IPv4 address is asked, and a lookup of such a name takes its IPv6 addresses
+	// (dns/client_ipv6.go)
+	IPv6IfNoIPv4 bool `json:"ipv6_if_no_ipv4,omitempty"`
 }
 
 type _OptimisticDNSOptions struct {
@@ -210,7 +214,7 @@ type RemoteHTTPSDNSServerOptions struct {
 
 type FakeIPDNSServerOptions struct {
 	Inet4Range *badoption.Prefix `json:"inet4_range,omitempty" examples:"198.18.0.0/15"`
-	Inet6Range *badoption.Prefix `json:"inet6_range,omitempty" examples:"fc00::/18"`
+	Inet6Range *badoption.Prefix `json:"inet6_range,omitempty" examples:"2001:2::/48"`
 }
 
 type DHCPDNSServerOptions struct {

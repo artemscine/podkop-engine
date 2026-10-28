@@ -72,3 +72,39 @@ func TestFallbackSelectionConfiguration(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "unknown fallback_selection")
 }
+
+type fallbackNetworkGroup struct {
+	*testGroup
+	udp adapter.Outbound
+}
+
+func (g *fallbackNetworkGroup) All() []string {
+	return []string{g.member.Tag(), g.udp.Tag()}
+}
+
+func (g *fallbackNetworkGroup) Selected(network string) adapter.Outbound {
+	if network == N.NetworkUDP {
+		return g.udp
+	}
+	return g.member
+}
+
+// Recovery and the fastest fallback must judge the nested member selected for the
+// requested network: a recovering TCP path need not disqualify its healthy UDP path.
+func TestFallbackSelectionRecoveryUsesNestedMemberForNetwork(t *testing.T) {
+	a := newTestMember(C.TypeVLESS, "a", dialWorking)
+	tcp := newTestMember(C.TypeVLESS, "tcp", dialWorking)
+	udp := newTestMember(C.TypeVLESS, "udp", dialWorking)
+	selector := &fallbackNetworkGroup{
+		testGroup: &testGroup{testMember: newTestMember(C.TypeSelector, "selector", dialWorking), member: tcp},
+		udp:       udp,
+	}
+	f := newTestMember(C.TypeVLESS, "f", dialWorking)
+	_, g := newTestFallbackGroup(t, "", "", members(a), []adapter.Outbound{selector, f}, map[string]uint16{"tcp": 10, "udp": 20, "f": 100})
+	g.fallbackFastest = true
+	g.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{})
+	g.recoveryFailed(tcp.Tag())
+	g.performUpdateCheck()
+	assertSelected(t, g, N.NetworkTCP, f)
+	assertSelected(t, g, N.NetworkUDP, selector)
+}

@@ -391,6 +391,29 @@ func (c *poolClient) shutdown() {
 	c.closeOnce.Do(c.connection.close)
 }
 
+// closeIdle takes the clients no session or request uses out of the pool and closes
+// them; the busy ones stay. A get counts its client as running under the lock, so
+// a client found idle here is not handed out meanwhile.
+func (p *pool) closeIdle() {
+	p.access.Lock()
+	var idle []*poolClient
+	busy := p.clients[:0]
+	for _, client := range p.clients {
+		if client.running.Load() > 0 {
+			busy = append(busy, client)
+			continue
+		}
+		p.retireLocked(client)
+		idle = append(idle, client)
+	}
+	clear(p.clients[len(busy):])
+	p.clients = busy
+	p.access.Unlock()
+	for _, client := range idle {
+		client.closeIfIdle()
+	}
+}
+
 // close closes every client, those in the pool and those retired from it that
 // sessions still hold, and forgets what it held against the server: the pool
 // starts anew, with the next get opening a connection. The sessions on the

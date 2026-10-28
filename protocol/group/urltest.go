@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"io"
 	"maps"
 	"net"
 	"slices"
@@ -40,7 +41,6 @@ type URLTest struct {
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
-	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
 	tags                         []string
 	recoveryOptions              *option.URLTestFallbackRecoveryOptions
@@ -70,7 +70,6 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, all),
 		ctx:                          ctx,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
-		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
 		fallbackTags:                 options.Fallbacks,
@@ -85,6 +84,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
+	}
+	for i, tag := range outbound.tags {
+		if slices.Contains(outbound.tags[:i], tag) {
+			return nil, E.New("duplicate tag: ", tag)
+		}
 	}
 	if len(outbound.fallbackTags) > 0 {
 		listed := make(map[string]bool, len(all))
@@ -158,6 +162,24 @@ func (s *URLTest) Now() string {
 // All lists the outbounds, then the fallbacks.
 func (s *URLTest) All() []string {
 	return s.all
+}
+
+func (s *URLTest) Selected(network string) adapter.Outbound {
+	var outbound adapter.Outbound
+	if network == N.NetworkUDP {
+		outbound = s.group.selectedOutboundUDP.Load()
+	} else {
+		outbound = s.group.selectedOutboundTCP.Load()
+	}
+	if outbound == nil {
+		outbound, _ = s.group.Select(network)
+	}
+	return outbound
+}
+
+func (s *URLTest) AttachConnection(closer io.Closer) func() {
+	s.group.Touch()
+	return s.group.interruptGroup.Add(closer, true)
 }
 
 func (s *URLTest) References() []string {
@@ -289,16 +311,6 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	s.group.memberFailed(ctx, outbound, N.NetworkUDP, err, time.Time{})
 	return nil, memberError(outbound, err)
-}
-
-func (s *URLTest) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
-}
-
-func (s *URLTest) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = interrupt.ContextWithIsExternalConnection(ctx)
-	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
 
 type URLTestGroup struct {
@@ -461,7 +473,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 	}
 	// a fallback in use holds back no outbound: it is chosen only while none is a candidate
 	if selected != nil && !g.isFallback(selected) {
-		tag := RealTag(g.outbound, selected)
+		tag := RealTag(selected, network)
 		if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
 			minOutbound = selected
 			minDelay = history.Delay
@@ -471,7 +483,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
-		tag := RealTag(g.outbound, detour)
+		tag := RealTag(detour, network)
 		history := g.history.LoadURLTestHistory(tag)
 		if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 			continue
@@ -483,7 +495,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 	}
 	if minOutbound == nil {
 		if g.fallbackFastest && selected != nil && g.isFallback(selected) && common.Contains(selected.Network(), network) {
-			tag := RealTag(g.outbound, selected)
+			tag := RealTag(selected, network)
 			if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
 				minOutbound, minDelay = selected, history.Delay
 			}
@@ -492,7 +504,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 			if !common.Contains(detour.Network(), network) {
 				continue
 			}
-			tag := RealTag(g.outbound, detour)
+			tag := RealTag(detour, network)
 			history := g.history.LoadURLTestHistory(tag)
 			if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 				continue
@@ -646,7 +658,7 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundManager, outboundGroup))
+		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
 		if groupHistory != nil {
 			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
 		}

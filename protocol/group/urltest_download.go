@@ -85,7 +85,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 		if candidate == nil || !exists {
 			break
 		}
-		tag := RealTag(g.outbound, candidate)
+		tag := RealTag(candidate, N.NetworkTCP)
 		if candidate == current {
 			if _, wasFrozen := g.frozen.Load()[tag]; !wasFrozen {
 				break
@@ -106,7 +106,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 		g.recoveryFailed(tag)
 		tried[tag] = true
 	}
-	if current != nil && g.history.LoadURLTestHistory(RealTag(g.outbound, current)) != nil {
+	if current != nil && g.history.LoadURLTestHistory(RealTag(current, N.NetworkTCP)) != nil {
 		return current, true
 	}
 	return g.Select(N.NetworkTCP)
@@ -116,7 +116,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 // download check may keep the next selection waiting (one download test per candidate):
 // connections then go by the plain choice instead of a member known to be down.
 func (g *URLTestGroup) selectionPending(selected adapter.Outbound) bool {
-	return g.downloadLink != "" && g.history.LoadURLTestHistory(RealTag(g.outbound, selected)) == nil
+	return g.downloadLink != "" && g.history.LoadURLTestHistory(RealTag(selected, N.NetworkTCP)) == nil
 }
 
 // selectUDP chooses the UDP member as Select does, passing over the members frozen for TCP.
