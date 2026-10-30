@@ -30,6 +30,10 @@ func TestURLTestOfFallbacksOnly(t *testing.T) {
 	require.NoError(t, err)
 	_, err = NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("urltest"), "t", option.URLTestOutboundOptions{})
 	require.ErrorContains(t, err, "missing tags")
+	both, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("urltest"), "t", option.URLTestOutboundOptions{Outbounds: []string{"a"}, Fallbacks: []string{"f1"}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "f1"}, both.(*URLTest).All())
+	require.Equal(t, []string{"f1"}, both.(*URLTest).Fallbacks())
 
 	f1, f2 := newTestMember(C.TypeSOCKS, "f1", dialRefused), newTestMember(C.TypeSOCKS, "f2", dialRefused)
 	_, group := newTestFallbackGroup(t, "", "", nil, members(f1, f2), map[string]uint16{"f2": 100})

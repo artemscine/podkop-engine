@@ -154,6 +154,11 @@ func (s *URLTest) All() []string {
 	return s.all
 }
 
+// Fallbacks lists the fallbacks, the end of All (podkop-engine): what is tested is the rest.
+func (s *URLTest) Fallbacks() []string {
+	return s.fallbackTags
+}
+
 func (s *URLTest) Selected(network string) adapter.Outbound {
 	var outbound adapter.Outbound
 	if network == N.NetworkUDP {

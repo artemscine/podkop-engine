@@ -83,6 +83,10 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		}
 		info.Put("now", now)
 		info.Put("all", group.All())
+		// the end of "all" that a delay test of the group leaves out (podkop-engine)
+		if withFallbacks, isURLTest := detour.(interface{ Fallbacks() []string }); isURLTest && len(withFallbacks.Fallbacks()) > 0 {
+			info.Put("fallbacks", withFallbacks.Fallbacks())
+		}
 	}
 	return &info
 }
