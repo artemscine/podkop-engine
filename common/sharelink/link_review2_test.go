@@ -1,6 +1,7 @@
 package sharelink
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
@@ -51,6 +52,25 @@ func TestParameterNamesThatAreNone(t *testing.T) {
 	require.Empty(t, warnings)
 	require.True(t, plainName("sb.transport.download.tls.reality.public_key"))
 	require.False(t, plainName(""))
+}
+
+// The JSON in extra may hold spaces and addresses at once: it is no second link on the line. A
+// link after the JSON is, and no message repeats it.
+func TestExtraHoldsSpacesAndAddresses(t *testing.T) {
+	t.Parallel()
+	const canary = "CANARY0f6d2c"
+	base := "vless://" + testUUID + "@example.org:443?type=xhttp&security=tls&sni=example.org&extra="
+	for name, extra := range map[string]string{
+		"a browser":     `{"headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64)","Referer":"https://example.org/a"}}`,
+		"several lines": "{\n  \"headers\": {\n    \"Referer\": \"https://example.org/a\"\n  }\n}\n",
+	} {
+		content, warnings := decodeJSON(t, base+url.QueryEscape(extra))
+		require.Contains(t, content, "https://example.org/a", name)
+		require.Empty(t, warnings, name)
+	}
+	_, _, err := Decode(base + url.QueryEscape(`{"headers":{"Referer":"https://example.org/a"}}`) + "%20vless://" + canary + "@h.example.org:443")
+	require.ErrorContains(t, err, "the link parameter extra contains a space and another link")
+	require.NotContains(t, err.Error(), canary)
 }
 
 // The keys and the values of the JSON in extra are as free a text as the names of
