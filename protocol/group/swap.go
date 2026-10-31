@@ -44,13 +44,14 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 			sharedTags[member.Tag()] = true
 		}
 	}
-	if selected := from.selectedOutboundTCP.Load(); selected != nil && shared[selected] {
+	sameCheck := g.link == from.link
+	if selected := from.selectedOutboundTCP.Load(); sameCheck && selected != nil && shared[selected] {
 		g.selectedOutboundTCP.Store(selected)
 	}
-	if selected := from.selectedOutboundUDP.Load(); selected != nil && shared[selected] {
+	if selected := from.selectedOutboundUDP.Load(); sameCheck && selected != nil && shared[selected] {
 		g.selectedOutboundUDP.Store(selected)
 	}
-	if frozen := from.frozen.Load(); len(frozen) > 0 {
+	if frozen := from.frozen.Load(); sameCheck && g.downloadLink == from.downloadLink && len(frozen) > 0 {
 		kept := make(map[string]time.Time)
 		for tag, at := range frozen {
 			if sharedTags[tag] {
@@ -61,7 +62,17 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 	}
 	// Recovery is evidence about the same server objects, not merely their reusable tags.
 	// Copy it: an in-flight round of the retiring group must not change the successor's proof.
-	if g.fallbackRecovery != nil && from.fallbackRecovery != nil {
+	if sameCheck {
+		for member := range shared {
+			for _, network := range member.Network() {
+				if history := from.memberHistory(member, network); history != nil {
+					g.history.StoreURLTestHistory(RealTag(member, network), history)
+					g.checkedMembers.Store(RealTag(member, network), struct{}{})
+				}
+			}
+		}
+	}
+	if sameCheck && g.fallbackRecovery != nil && from.fallbackRecovery != nil {
 		proofTags := make(map[string]bool)
 		for member := range shared {
 			for _, network := range member.Network() {
@@ -116,12 +127,12 @@ func (s *Selector) ReleaseMembers() {
 }
 
 // checkUntested is the first round of a group that took over (TakeOver): only the members
-// without a test result are tested, hotRoundConcurrency at a time; the others were tested by
-// the group before, which shares the history.
+// without a test result are tested, hotRoundConcurrency at a time; the others have evidence
+// copied from the group before for the identical member object and check URL.
 func (g *URLTestGroup) checkUntested() {
 	var untested []adapter.Outbound
 	for _, member := range g.members {
-		if g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP)) == nil {
+		if g.memberHistory(member, N.NetworkTCP) == nil {
 			untested = append(untested, member)
 		}
 	}

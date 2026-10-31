@@ -329,6 +329,7 @@ type URLTestGroup struct {
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
+	sharedHistory                *urltest.HistoryStorage // dashboard publication; never selection evidence
 	checking                     atomic.Bool
 	recheck                      atomic.Bool
 	lastRound                    atomic.Int64  // when the last round began, since epoch
@@ -351,6 +352,7 @@ type URLTestGroup struct {
 	unansweredConfirms           map[string]*memberConfirm
 	epoch                        time.Time
 	successes                    sync.Map // member tag → *atomic.Int64, its last successful TCP dial, since epoch
+	checkedMembers               sync.Map // member tag → struct{}, a conclusive check or failure judgment
 	localFailures                sync.Map // member tag → a failure of this host's own network waits to be judged
 	// when the network last paused or woke, and when the pause in force was reported,
 	// since epoch (networkChangedSince, networkPaused)
@@ -405,7 +407,8 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		interval:                     interval,
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
-		history:                      history,
+		history:                      urltest.NewHistoryStorage(),
+		sharedHistory:                history,
 		close:                        make(chan struct{}),
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
@@ -512,7 +515,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 	// a fallback in use holds back no outbound: it is chosen only while none is a candidate
 	if selected != nil && !g.isFallback(selected) {
 		tag := RealTag(selected, network)
-		if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
+		if history := g.memberHistory(selected, network); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
 			minOutbound = selected
 			minDelay = history.Delay
 		}
@@ -522,7 +525,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 			continue
 		}
 		tag := RealTag(detour, network)
-		history := g.history.LoadURLTestHistory(tag)
+		history := g.memberHistory(detour, network)
 		if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 			continue
 		}
@@ -555,7 +558,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 				}
 				if candidate == selected {
 					tag := RealTag(selected, network)
-					if history := g.history.LoadURLTestHistory(tag); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
+					if history := g.memberHistory(selected, network); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
 						minOutbound, minDelay = selected, history.Delay
 					}
 					break
@@ -576,7 +579,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 				return detour, true
 			}
 			tag := RealTag(detour, network)
-			history := g.history.LoadURLTestHistory(tag)
+			history := g.memberHistory(detour, network)
 			if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 				continue
 			}
@@ -753,7 +756,7 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
+		groupHistory := MemberHistory(history, outboundGroup, N.NetworkTCP)
 		if groupHistory != nil {
 			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
 		}
@@ -812,7 +815,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						return nil, nil
 					}
 					if testResult.err != nil && localNetworkError(testResult.err) {
-						owner.afterLocalFailure(tag, func() { owner.history.DeleteURLTestHistory(tag); owner.recoveryFailed(tag); owner.requestUpdateCheck() })
+						owner.afterLocalFailure(tag, func() { owner.deleteHistory(tag); owner.recoveryFailed(tag); owner.requestUpdateCheck() })
 						return nil, nil
 					}
 					if testResult.err != nil {
@@ -826,7 +829,11 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
+					if owner != nil {
+						owner.deleteHistory(tag)
+					} else {
+						b.history.DeleteURLTestHistory(tag)
+					}
 				} else {
 					if b.ctx.Err() != nil {
 						// the round ended with its group (podkop-engine): the tag may be
@@ -834,10 +841,15 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+					history := &adapter.URLTestHistory{
 						Time:  time.Now(),
 						Delay: testResult.delay,
-					})
+					}
+					if owner != nil {
+						owner.storeHistory(tag, history)
+					} else {
+						b.history.StoreURLTestHistory(tag, history)
+					}
 					b.access.Lock()
 					b.result[tag] = testResult.delay
 					b.access.Unlock()
@@ -905,7 +917,7 @@ func (g *URLTestGroup) updateSelection() {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
 	if selected {
-		g.history.NotifyUpdated()
+		g.notifyHistory()
 	}
 	g.retryBlock()
 	g.closeUnanswered()

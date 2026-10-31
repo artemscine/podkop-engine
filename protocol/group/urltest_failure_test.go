@@ -37,6 +37,9 @@ func newTestURLTest(t *testing.T, link string, members ...*testMember) (*URLTest
 	}
 	group, err := NewURLTestGroup(ctx, nil, log.NewNOPFactory().Logger(), outbounds, nil, link, "", time.Minute, 50, 0, false)
 	require.NoError(t, err)
+	for i, member := range members {
+		group.history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(10 + 100*i)})
+	}
 	group.performUpdateCheck()
 	require.Equal(t, members[0].Tag(), group.selectedOutboundTCP.Load().Tag())
 	return &URLTest{group: group, logger: log.NewNOPFactory().NewLogger("urltest")}, group

@@ -114,6 +114,7 @@ func TestTakeOverRoundRecordsRecoveryFailures(t *testing.T) {
 	bad := newTestMember(C.TypeVLESS, "bad", dialRefused)
 	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
 	old := newSwapGroup(t, history, link, a)
+	old.group.history.StoreURLTestHistory("a", history.LoadURLTestHistory("a"))
 	next := newSwapGroup(t, history, link, a, bad)
 	next.group.fallbackRecovery = newFallbackRecovery(&option.URLTestFallbackRecoveryOptions{})
 	next.TakeOver(old)

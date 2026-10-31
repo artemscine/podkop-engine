@@ -121,7 +121,7 @@ func (g *URLTestGroup) judgeFailure(tag string, member adapter.Outbound, network
 			return
 		}
 		g.logger.Info("outbound ", tag, " unavailable: ", err)
-		g.history.DeleteURLTestHistory(tag)
+		g.deleteHistory(tag)
 		g.recoveryFailed(tag)
 	}
 	g.requestUpdateCheck()
@@ -183,7 +183,7 @@ func (g *URLTestGroup) networkPaused() bool {
 	}
 	reported := g.epoch.Add(time.Duration(g.networkPauseAt.Load()))
 	for _, member := range g.members {
-		history := g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP))
+		history := g.memberHistory(member, N.NetworkTCP)
 		if history != nil && history.Time.After(reported) {
 			return false
 		}
@@ -237,7 +237,7 @@ func (g *URLTestGroup) probeUnseenNetwork() {
 		return
 	}
 	for _, member := range g.members {
-		if g.history.LoadURLTestHistory(RealTag(member, N.NetworkTCP)) != nil {
+		if g.memberHistory(member, N.NetworkTCP) != nil {
 			return
 		}
 	}
@@ -366,7 +366,7 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 		}
 		unavailable := func() {
 			g.logger.Info("outbound ", tag, " unavailable: ", err)
-			g.history.DeleteURLTestHistory(tag)
+			g.deleteHistory(tag)
 			g.recoveryFailed(tag)
 			g.performUpdateCheck()
 		}

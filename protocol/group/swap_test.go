@@ -22,8 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newSwapGroup makes a group of the members on a shared history, as the groups of one box
-// have it.
+// newSwapGroup makes a group with the shared dashboard publication store of one box.
 func newSwapGroup(t *testing.T, history *urltest.HistoryStorage, link string, members ...adapter.Outbound) *URLTest {
 	ctx := service.ContextWith[pause.Manager](service.ContextWithPtr(context.Background(), history), &testPause{})
 	group, err := NewURLTestGroup(ctx, nil, log.NewNOPFactory().Logger(), members, nil, link, "", time.Minute, 50, 0, false)
@@ -42,6 +41,8 @@ func TestURLTestTakeOver(t *testing.T) {
 	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 300})
 	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 280})
 	old := newSwapGroup(t, history, link, a, b)
+	old.group.history.StoreURLTestHistory("a", history.LoadURLTestHistory("a"))
+	old.group.history.StoreURLTestHistory("b", history.LoadURLTestHistory("b"))
 	old.group.performUpdateCheck()
 	require.Equal(t, "a", old.group.selectedOutboundTCP.Load().Tag())
 	old.group.setFrozen("a", time.Now())
@@ -168,6 +169,11 @@ func TestURLTestMembersInUse(t *testing.T) {
 	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
 	history.StoreURLTestHistory("b", &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
 	group := newSwapGroup(t, history, link, a, b)
+	for _, tag := range []string{"a", "b"} {
+		if entry := history.LoadURLTestHistory(tag); entry != nil {
+			group.group.history.StoreURLTestHistory(tag, entry)
+		}
+	}
 	group.group.performUpdateCheck()
 	destination := M.ParseSocksaddr(listener.Addr().String())
 
@@ -187,7 +193,7 @@ func TestURLTestMembersInUse(t *testing.T) {
 	require.Empty(t, group.MembersInUse())
 
 	// what the group dials past its choice while that waits counts for the member it dialed
-	history.DeleteURLTestHistory("a")
+	group.group.deleteHistory("a")
 	group.group.downloadLink = "http://127.0.0.1:1/"
 	third, err := group.DialContext(context.Background(), N.NetworkTCP, destination)
 	require.NoError(t, err)
@@ -205,6 +211,11 @@ func TestReleaseMembers(t *testing.T) {
 	b := newTestMember(C.TypeVLESS, "b", dialWorking)
 	history.StoreURLTestHistory("a", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
 	group := newSwapGroup(t, history, link, a, b)
+	for _, tag := range []string{"a", "b"} {
+		if entry := history.LoadURLTestHistory(tag); entry != nil {
+			group.group.history.StoreURLTestHistory(tag, entry)
+		}
+	}
 	group.group.performUpdateCheck()
 	group.Retire()
 	group.ReleaseMembers()

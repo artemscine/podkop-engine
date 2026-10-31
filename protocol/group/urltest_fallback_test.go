@@ -35,6 +35,9 @@ func newTestFallbackGroup(t *testing.T, link, downloadLink string, outbounds, fa
 	}
 	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().Logger(), outbounds, fallbacks, link, downloadLink, time.Minute, 50, 0, false)
 	require.NoError(t, err)
+	for tag, delay := range delays {
+		group.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+	}
 	// the results are those of a round (roundDone)
 	group.roundDone.Store(true)
 	group.performUpdateCheck()
