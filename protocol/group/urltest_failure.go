@@ -69,6 +69,15 @@ func serverOnlyDial(outbound adapter.Outbound) bool {
 // memberFailed judges a failed dial through member, begun at start, or a failed handshake
 // write (start is zero).
 func (g *URLTestGroup) memberFailed(ctx context.Context, member adapter.Outbound, network string, err error, start time.Time) {
+	if member.Type() == C.TypeBlock {
+		// refusing is what a block fallback is chosen for (podkop-engine)
+		return
+	}
+	if g.closed.Load() {
+		// a group that was replaced judges nothing (podkop-engine): another tests the members
+		// now, and its members may be let go of
+		return
+	}
 	if g.networkPaused() {
 		// without a network every dial fails at once: that says nothing about the member
 		return
@@ -270,7 +279,7 @@ func (g *URLTestGroup) succeededSince(tag string, start time.Time) bool {
 // waits to run are covered by it, so at most one selection waits at any time (a selection
 // may run long: the download test).
 func (g *URLTestGroup) requestUpdateCheck() {
-	if g.updatePending.Swap(true) {
+	if g.closed.Load() || g.updatePending.Swap(true) {
 		return
 	}
 	go func() {
@@ -337,7 +346,9 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 	g.confirmAccess.Unlock()
 	go func() {
 		start := time.Now()
-		_, err := testOutbound(g.ctx, g.link, member)
+		// past probeSlots: one test of a member whose connections fail, paced as above, is
+		// no burst, and behind the rounds it would keep the group on a dead member
+		_, err := probeOutbound(g.ctx, g.link, member)
 		now := time.Now()
 		g.confirmAccess.Lock()
 		state.running = false
@@ -368,8 +379,26 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 	return true
 }
 
-// testOutbound runs one URL test of detour, bounded by the TCP timeout.
+// probeSlots bound how many URL tests run at once in the whole process (podkop-engine):
+// every group runs its rounds at its own time, ten members at once, so a router with a few
+// groups of large subscriptions would open tens of connections at a time. Bursts of TLS
+// hellos are what operators' DPI freezes, and a small CPU lags under them.
+var probeSlots = make(chan struct{}, 4)
+
+// testOutbound runs one URL test of detour (probeOutbound) once one of probeSlots is free:
+// the wait for the slot does not take the time of the test.
 func testOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
+	select {
+	case probeSlots <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	defer func() { <-probeSlots }()
+	return probeOutbound(ctx, link, detour)
+}
+
+// probeOutbound runs one URL test of detour, bounded by the TCP timeout.
+func probeOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
 	ctx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 	defer cancel()
 	type result struct {

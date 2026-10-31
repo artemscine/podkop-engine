@@ -63,6 +63,19 @@ func (r *fallbackRecovery) failed(tag string) {
 	r.members[tag] = &fallbackRecoveryMember{failuresAt: time.Now()}
 }
 
+func (r *fallbackRecovery) takeOver(previous *fallbackRecovery, sharedTags map[string]bool) {
+	previous.access.Lock()
+	defer previous.access.Unlock()
+	// The successor has not started its rounds yet. Its policy stays its own, while
+	// the observations accumulated by unchanged members survive the outbound swap.
+	for tag, member := range previous.members {
+		if sharedTags[tag] {
+			copy := *member
+			r.members[tag] = &copy
+		}
+	}
+}
+
 func (r *fallbackRecovery) answered(tag string, at time.Time, interval time.Duration) {
 	r.access.Lock()
 	defer r.access.Unlock()
