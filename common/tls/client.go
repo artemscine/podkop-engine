@@ -185,6 +185,13 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
 	return d.dialContext(ctx, destination, true)
 }
 
+// detectRecorder is a TLS client that records for the block detector what a handshake met. It is
+// used only when the fingerprint fallback is off, since the fallback records the outcome itself;
+// implemented by the REALITY client (podkop-engine).
+type detectRecorder interface {
+	recordDetectOutcome(ctx context.Context, destination M.Socksaddr, handshakeErr error)
+}
+
 func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
 	// Inside the connection of another outbound the socket is not the server's: there is
 	// no ClientHello of this client to watch on it, and a forged one would be sent to the
@@ -222,6 +229,14 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
 		}
 		tlsConn, err := aTLS.ClientHandshake(ctx, conn, config)
 		unanswered := watch.stop()
+		if fallback == nil && !tunnel {
+			// the fallback is off, so nothing else records the outcome for the block detector.
+			// Only for a direct dial: a handshake through a detour times out on the tunnel, not
+			// on the server's path, so recording it would feed the detector a false failure.
+			if recorder, ok := d.config.(detectRecorder); ok {
+				recorder.recordDetectOutcome(ctx, destination, err)
+			}
+		}
 		// a handshake that completed in the instant the watch gave the connection up has
 		// a closed socket under it
 		if err == nil && !unanswered {

@@ -707,6 +707,20 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	return testBatch.result
 }
 
+// roundEnded tells whether the round of ctx is over (podkop-engine): canceled, or its deadline
+// (a delay test of the Clash API) has come. The timer of the context closes it a moment after
+// the deadline, and until then Err is nil while the tests the deadline cut fail already: a dial
+// under way times out at the deadline, which the dialer takes from the context, and one that
+// got its slot in that moment fails at once with "i/o timeout". Such a failure is the round's,
+// not the member's.
+func roundEnded(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	return hasDeadline && !time.Now().Before(deadline)
+}
+
 func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
 	for _, detour := range outbounds {
 		tag := detour.Tag()
@@ -752,11 +766,11 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				var testResult urlTestResult
 				testResult.delay, testResult.err = testOutbound(b.ctx, link, detour)
 				if testResult.err != nil {
-					if b.ctx.Err() != nil {
+					if roundEnded(b.ctx) {
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
+					b.history.StoreURLTestFailure(tag, time.Now())
 				} else {
 					if b.ctx.Err() != nil {
 						// the round ended with its group (podkop-engine): the tag may be

@@ -688,6 +688,15 @@ type choiceCache struct {
 	access  sync.Mutex
 	choices map[string]choiceEntry
 	writes  int
+	// the block detector's outcomes, and the writes of them
+	outcomes      map[string]outcomeEntry
+	outcomeWrites int
+}
+
+type outcomeEntry struct {
+	flags       byte
+	fingerprint string
+	at          time.Time
 }
 
 type choiceEntry struct {
@@ -707,6 +716,24 @@ func (c *choiceCache) StoreUTLSChoice(key string, choice string, at time.Time) e
 	defer c.access.Unlock()
 	c.choices[key] = choiceEntry{choice, at}
 	c.writes++
+	return nil
+}
+
+func (c *choiceCache) LoadDetectOutcome(key string) (byte, string, time.Time, bool) {
+	c.access.Lock()
+	defer c.access.Unlock()
+	entry, loaded := c.outcomes[key]
+	return entry.flags, entry.fingerprint, entry.at, loaded
+}
+
+func (c *choiceCache) StoreDetectOutcome(key string, flags byte, fingerprint string, at time.Time) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.outcomes == nil {
+		c.outcomes = make(map[string]outcomeEntry)
+	}
+	c.outcomes[key] = outcomeEntry{flags, fingerprint, at}
+	c.outcomeWrites++
 	return nil
 }
 

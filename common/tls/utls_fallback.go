@@ -142,6 +142,8 @@ type utlsFallbackPath struct {
 	// the last rest after a whole list: how long it was, and when it ended
 	rest           time.Duration
 	exhaustedUntil time.Time
+	// the candidate this path last told the block detector of (-1: none)
+	reported int
 }
 
 // twice tells whether the candidate in use is left only after two unanswered connections:
@@ -192,6 +194,12 @@ type utlsFallback struct {
 	// write waits for the file (a batch of bbolt) and is not made under access
 	storing sync.Mutex
 	stored  time.Time
+	// what the block detector reads of the server (podkop-engine)
+	outcome detectOutcomeWriter
+	// The first candidate was refused as a stranger's, and neither has it completed a handshake
+	// since nor has the list ended. A wrong key does this as well: only a later candidate that
+	// completes tells the server is one since Xray-core v26.9.8.
+	sawRefused bool
 }
 
 // utlsFallbackEnabled tells whether the fallback is on: the option
@@ -297,6 +305,7 @@ func (f *utlsFallback) load(serverName string, destination M.Socksaddr) {
 	if f.cache == nil {
 		return
 	}
+	f.outcome.open(f.cache, f.key)
 	choice, at, loaded := f.cache.LoadUTLSChoice(f.key)
 	if !loaded || time.Since(at) >= utlsFallbackRecheck {
 		return
@@ -342,7 +351,7 @@ func (f *utlsFallback) path(conn net.Conn) *utlsFallbackPath {
 			return path
 		}
 	}
-	path := &utlsFallbackPath{local: local, last: -1, resume: -1, choice: -1}
+	path := &utlsFallbackPath{local: local, last: -1, resume: -1, choice: -1, reported: -1}
 	if f.saved >= 0 {
 		// what was chosen for the server before, on this or another address
 		path.position, path.last, path.chosen, path.choice = f.saved, f.saved, f.savedAt, f.saved
@@ -409,6 +418,11 @@ func (f *utlsFallback) exhausted(path *utlsFallbackPath, now time.Time, destinat
 		path.rest = utlsFallbackRest
 	}
 	path.exhaustedUntil = now.Add(path.rest)
+	// the rest below zeroes the count
+	outcome := adapter.DetectNoAnswer
+	if path.refused > 0 {
+		outcome = adapter.DetectFailed
+	}
 	said := F.ToString("ClientHello unanswered with all of ", f.names())
 	line := F.ToString("ClientHello to ", destination, " unanswered with all of ", f.names())
 	if path.refused > 0 {
@@ -428,6 +442,9 @@ func (f *utlsFallback) exhausted(path *utlsFallbackPath, now time.Time, destinat
 		kept += " is used: it worked here last"
 	}
 	f.warn("tls: ", line, f.cause(), "; the fallback rests for ", path.rest, ", ", kept)
+	// no candidate that followed the refusal of the first one completed: it told nothing
+	f.sawRefused = false
+	f.outcome.failed(now, outcome)
 	return said + f.cause()
 }
 
@@ -556,12 +573,45 @@ func (d *utlsFallbackDial) rechecked(path *utlsFallbackPath, now time.Time, answ
 	f.store(path, now)
 }
 
+// recordAnswered tells the block detector of a completed handshake. Any such handshake clears
+// the failures. The caller holds the lock.
+func (d *utlsFallbackDial) recordAnswered(path *utlsFallbackPath, now time.Time) {
+	f := d.fallback
+	if d.position == 0 {
+		f.sawRefused = false
+	}
+	// The fingerprint is told when this path goes on to another candidate, so two paths with
+	// candidates of their own do not write by turns. A dial that began with a candidate the path
+	// has left says only that the server answers.
+	current := d.recheck || d.position == path.position
+	report := current && path.reported != d.position
+	if current {
+		path.reported = d.position
+	}
+	name := f.candidates[d.position].String()
+	f.outcome.answered(now, func(flags byte, fingerprint string) (byte, string) {
+		switch {
+		case d.position == 0:
+			flags = 0
+		case f.sawRefused:
+			flags = adapter.DetectRefused
+		default:
+			flags &= adapter.DetectRefused
+		}
+		if report || (current && fingerprint == "") {
+			fingerprint = name
+		}
+		return flags, fingerprint
+	})
+}
+
 func (d *utlsFallbackDial) answered() {
 	f := d.fallback
 	f.access.Lock()
 	defer f.access.Unlock()
 	path := d.path
 	now := time.Now()
+	d.recordAnswered(path, now)
 	if d.recheck {
 		d.rechecked(path, now, true)
 		return
@@ -657,6 +707,9 @@ func (d *utlsFallbackDial) failed(ctx context.Context, destination M.Socksaddr, 
 	now := time.Now()
 	var stranger *realityStrangerError
 	refused := errors.As(err, &stranger)
+	if refused && d.position == 0 {
+		f.sawRefused = true
+	}
 	if d.recheck && ctx.Err() == nil {
 		// what the first candidate met, the choice is kept: the dial goes on with it
 		d.rechecked(path, now, false)
@@ -668,8 +721,12 @@ func (d *utlsFallbackDial) failed(ctx context.Context, destination M.Socksaddr, 
 	}
 	if !refused && path.worked&(1<<d.position) != 0 {
 		// answered, with a failure of another kind, a candidate that has worked here: not
-		// what the fallback is for
+		// what the fallback is for. A failed verification of a saved choice is still the block
+		// detector's: the list is not walked here, so nothing else would tell it
 		path.suspected = time.Time{}
+		if realityVerificationError(err) {
+			f.outcome.failed(now, adapter.DetectFailed)
+		}
 		return false
 	}
 	// A server that answers the ClientHello as a stranger's takes none of its kind (a
