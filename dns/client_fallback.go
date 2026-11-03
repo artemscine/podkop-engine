@@ -13,6 +13,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
@@ -37,7 +38,9 @@ import (
 // and a local or private resolver (127.0.0.1, LAN, VPN) never fall back and behave
 // exactly as without this code. Routes of the system are not looked at: a server sent
 // into a VPN by a route, not by sing-box, looks like any other. The fallback query goes
-// through the server's own dialer.
+// through the server's own dialer. A member of a group of servers (transport_group.go) has
+// no fallback of its own: the group decides whom to ask next, and asks the provider when
+// every member failed.
 //
 // After two failures in a row answered by the provider, the server is set aside: queries
 // go straight to the provider, and a copy of one query is sent to the server in the
@@ -55,6 +58,14 @@ import (
 // provider's servers and every change of state are there in a log that is not at the
 // info level.
 var fallbackEnabled = os.Getenv("SING_BOX_DNS_FALLBACK") != ""
+
+// stateContext is the context of a query for a line about a change of state that the query
+// caused. The queries sing-box makes itself (common/dialer/resolve.go) lower their lines to
+// the debug level, but a change of state is about the queries that follow, not about that
+// one: the override of the panic level keeps the level of every line.
+func stateContext(ctx context.Context) context.Context {
+	return log.ContextWithOverrideLevel(ctx, log.LevelPanic)
+}
 
 const (
 	fallbackPrimaryTimeout = 3500 * time.Millisecond
@@ -95,6 +106,10 @@ type fallbackServer struct {
 	unusableUntil time.Time
 
 	providers *providerSet // the box's, shared by all its servers (decide)
+
+	// grouped: the server is a member of a group (transport_group.go), which decides whom
+	// to ask when it fails; it has no fallback of its own then
+	grouped atomic.Bool
 }
 
 // newFallbackServer returns the fallback state of a remote server, nil when the fallback
@@ -106,7 +121,17 @@ func newFallbackServer(options option.RemoteDNSServerOptions) *fallbackServer {
 	return &fallbackServer{options: options}
 }
 
+// fallbackFor is the fallback state of a server that has the fallback: a remote server that
+// is no member of a group.
 func fallbackFor(transport adapter.DNSTransport) *fallbackServer {
+	state := fallbackStateOf(transport)
+	if state == nil || state.grouped.Load() {
+		return nil
+	}
+	return state
+}
+
+func fallbackStateOf(transport adapter.DNSTransport) *fallbackServer {
 	remote, isRemote := transport.(interface{ fallbackState() *fallbackServer })
 	if !isRemote {
 		return nil
@@ -184,7 +209,7 @@ func probeServer(ctx context.Context, logger logger.ContextLogger, transport ada
 	state.failures = 0
 	state.access.Unlock()
 	if wasDown && logger != nil {
-		logger.WarnContext(ctx, "server ", transport.Tag(), " answers again, provider DNS no longer used")
+		logger.WarnContext(stateContext(ctx), "server ", transport.Tag(), " answers again, provider DNS no longer used")
 	}
 }
 
@@ -399,7 +424,7 @@ func (s *fallbackServer) failure(ctx context.Context, logger logger.ContextLogge
 	s.access.Unlock()
 	if logger != nil {
 		// the logger formats only strings, numbers, errors and Stringers
-		logger.WarnContext(ctx, "server ", tag, " failed ", fallbackDownAfter, " times in a row (", cause, "), answering from provider DNS ", s.providers.names(), " until it is back")
+		logger.WarnContext(stateContext(ctx), "server ", tag, " failed ", fallbackDownAfter, " times in a row (", cause, "), answering from provider DNS ", s.providers.names(), " until it is back")
 	}
 }
 
@@ -444,7 +469,7 @@ func (s *fallbackServer) providerFailed(ctx context.Context, logger logger.Conte
 	s.unusableUntil = time.Now().Add(fallbackUnusableFor)
 	s.access.Unlock()
 	if logger != nil {
-		logger.WarnContext(ctx, "provider DNS does not answer for server ", tag, " (", cause, "), no fallback for it for ", fallbackUnusableFor)
+		logger.WarnContext(stateContext(ctx), "provider DNS does not answer for server ", tag, " (", cause, "), no fallback for it for ", fallbackUnusableFor)
 	}
 }
 
