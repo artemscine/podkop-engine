@@ -17,4 +17,7 @@ type URLTestOutboundOptions struct {
 	Tolerance                 uint16             `json:"tolerance,omitempty"`
 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+	// URLs are the URLs of the tests, one a round in turn; url is left out when they are set
+	// (podkop-engine)
+	URLs badoption.Listable[string] `json:"urls,omitempty"`
 }

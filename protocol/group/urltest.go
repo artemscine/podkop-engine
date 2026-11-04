@@ -45,7 +45,7 @@ type URLTest struct {
 	tags                         []string
 	fallbackTags                 []string
 	all                          []string
-	link                         string
+	links                        []string
 	downloadLink                 string
 	interval                     time.Duration
 	tolerance                    uint16
@@ -66,7 +66,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		tags:                         options.Outbounds,
 		fallbackTags:                 options.Fallbacks,
 		all:                          all,
-		link:                         options.URL,
+		links:                        testLinks(options),
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
@@ -92,6 +92,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 				return nil, E.New("fallback ", member, " is already listed in outbounds or fallbacks")
 			}
 			listed[member] = true
+		}
+	}
+	for _, link := range outbound.links {
+		if err := checkTestLink(link); err != nil {
+			return nil, err
 		}
 	}
 	var err error
@@ -128,10 +133,11 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			fallbacks = append(fallbacks, detour)
 		}
-		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, fallbacks, s.link, s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, fallbacks, "", s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 		if err != nil {
 			return err
 		}
+		group.links = s.links
 		s.group = group
 	case adapter.StartStateStarted:
 		s.group.PostStart()
@@ -317,7 +323,7 @@ type URLTestGroup struct {
 	outbounds                    []adapter.Outbound
 	fallbacks                    []adapter.Outbound
 	members                      []adapter.Outbound // the outbounds, then the fallbacks: what a round tests
-	link                         string
+	links                        []string           // the URLs of the tests, one a round in turn (roundPlan)
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
@@ -392,7 +398,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		outbounds:                    outbounds,
 		fallbacks:                    fallbacks,
 		members:                      slices.Concat(outbounds, fallbacks),
-		link:                         link,
+		links:                        linkList(link),
 		interval:                     interval,
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
@@ -646,7 +652,7 @@ func (g *URLTestGroup) urlTestMembers(ctx context.Context, members []adapter.Out
 			go g.CheckOutbounds(g.ctx, true)
 		}
 	}()
-	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency)
+	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, roundPlan(g.links, g.interval, time.Now()), g.interval, force, wait, concurrency)
 	if ctx.Err() == nil {
 		// a round cut short (a delay test of the Clash API that timed out) tested only some
 		g.roundDone.Store(true)
@@ -678,13 +684,14 @@ type urlTestBatch struct {
 // choice. Without, the selection runs after the call returns: the Clash API answers its
 // client in time, while the selection may run a download test of up to 15 s per candidate.
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
-	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, wait, urlTestConcurrency)
+	// a test the Clash API asks for has its own URL, and the delay it stores is the one measured
+	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, probePlan{links: []string{link}}, interval, force, wait, urlTestConcurrency)
 }
 
 // urlTestConcurrency is how many outbounds a round tests at a time.
 const urlTestConcurrency = 10
 
-func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool, concurrency int) map[string]uint16 {
+func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, plan probePlan, interval time.Duration, force bool, wait bool, concurrency int) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
 	testBatch := &urlTestBatch{
 		ctx:      ctx,
@@ -696,7 +703,7 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		wait:     wait,
 		result:   make(map[string]uint16),
 	}
-	testBatch.test(outbounds, link, interval, force)
+	testBatch.test(outbounds, plan, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
@@ -721,7 +728,7 @@ func roundEnded(ctx context.Context) bool {
 	return hasDeadline && !time.Now().Before(deadline)
 }
 
-func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
+func (b *urlTestBatch) test(outbounds []adapter.Outbound, plan probePlan, interval time.Duration, force bool) {
 	for _, detour := range outbounds {
 		tag := detour.Tag()
 		if b.checked[tag] || detour.Type() == C.TypeBlock {
@@ -751,7 +758,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.test(common.FilterNotNil(common.Map(nested.All(), func(it string) adapter.Outbound {
 				member, _ := b.outbound.Outbound(it)
 				return member
-			})), link, interval, force)
+			})), plan, interval, force)
 		default:
 			// A member that some group tested within this round is not tested again. The
 			// group's own test from the previous round must not count: it finished at most
@@ -764,24 +771,43 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
 				var testResult urlTestResult
-				testResult.delay, testResult.err = testOutbound(b.ctx, link, detour)
+				testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[0], detour)
+				if testResult.err != nil && len(plan.links) > 1 && !roundEnded(b.ctx) {
+					// one URL that does not answer through a member is not the member down
+					b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", plan.links[1])
+					testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[1], detour)
+				}
+				// a test the Clash API asked for (plan.keep 0) leaves a member whose delay is the
+				// median of the rounds as it is: one test with the URL of the client is no round
+				byClient := plan.keep == 0 && b.history.URLTestSmoothed(tag)
 				if testResult.err != nil {
-					if roundEnded(b.ctx) {
+					if roundEnded(b.ctx) || byClient {
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
 					b.history.StoreURLTestFailure(tag, time.Now())
+				} else if byClient {
+					b.access.Lock()
+					b.result[tag] = testResult.delay
+					b.access.Unlock()
 				} else {
 					if b.ctx.Err() != nil {
 						// the round ended with its group (podkop-engine): the tag may be
 						// another outbound's by now
 						return nil, nil
 					}
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
+					delay := testResult.delay
+					if plan.keep > 0 {
+						delay = b.history.StoreURLTestSample(tag, plan.round, plan.keep, delay)
+						b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms, the median of the last ", plan.keep, " rounds ", delay, "ms")
+					} else {
+						b.logger.Debug("outbound ", tag, " available: ", delay, "ms")
+					}
 					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
 						Time:  time.Now(),
-						Delay: testResult.delay,
+						Delay: delay,
 					})
+					testResult.delay = delay
 					b.access.Lock()
 					b.result[tag] = testResult.delay
 					b.access.Unlock()

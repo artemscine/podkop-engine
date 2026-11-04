@@ -163,6 +163,10 @@ func (g *URLTestGroup) setFrozen(tag string, at time.Time) {
 func (g *URLTestGroup) downloadStopped(tag string, member adapter.Outbound) bool {
 	ctx, cancel := context.WithTimeout(g.ctx, downloadTestTimeout)
 	defer cancel()
+	// a new connection to the first server of the member, like a URL test (probes)
+	if probes.waitHop(ctx, firstHop(g.outbound, member)) != nil {
+		return false
+	}
 	start := time.Now()
 	received, elapsed, err := urltest.DownloadTest(ctx, g.downloadLink, member)
 	switch {

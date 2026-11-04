@@ -237,9 +237,13 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		delay, err := urltest.URLTest(ctx, url, proxy)
 		defer func() {
 			realTag := group.RealTag(proxy, N.NetworkTCP)
-			if err != nil {
+			switch {
+			case server.urlTestHistory.URLTestSmoothed(realTag):
+				// a member whose delay is the median of the rounds of its groups keeps it: one
+				// test with the URL of the client is no round (podkop-engine)
+			case err != nil:
 				server.urlTestHistory.StoreURLTestFailure(realTag, time.Now())
-			} else {
+			default:
 				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: delay,
