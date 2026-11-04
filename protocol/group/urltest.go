@@ -714,6 +714,16 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	return testBatch.result
 }
 
+// storeLinkResult keeps whether a test of a round with link answered through the member tag
+// (retryLink, confirmLink): not for a test the Clash API asked for with its own URL, nor for one
+// the end of the round or of the group cut short, which proves nothing of the URL.
+func (b *urlTestBatch) storeLinkResult(plan probePlan, tag string, link string, err error) {
+	if plan.keep == 0 || roundEnded(b.ctx) {
+		return
+	}
+	b.history.StoreURLTestLinkResult(tag, link, err == nil)
+}
+
 // roundEnded tells whether the round of ctx is over (podkop-engine): canceled, or its deadline
 // (a delay test of the Clash API) has come. The timer of the context closes it a moment after
 // the deadline, and until then Err is nil while the tests the deadline cut fail already: a dial
@@ -772,10 +782,14 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, plan probePlan, interv
 			b.batch.Go(tag, func() (any, error) {
 				var testResult urlTestResult
 				testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[0], detour)
-				if testResult.err != nil && len(plan.links) > 1 && !roundEnded(b.ctx) {
+				b.storeLinkResult(plan, tag, plan.links[0], testResult.err)
+				if testResult.err != nil && !roundEnded(b.ctx) {
 					// one URL that does not answer through a member is not the member down
-					b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", plan.links[1])
-					testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[1], detour)
+					if retry := plan.retryLink(b.history, tag); retry != "" {
+						b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", retry)
+						testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, retry, detour)
+						b.storeLinkResult(plan, tag, retry, testResult.err)
+					}
 				}
 				// a test the Clash API asked for (plan.keep 0) leaves a member whose delay is the
 				// median of the rounds as it is: one test with the URL of the client is no round

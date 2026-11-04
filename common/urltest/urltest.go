@@ -33,6 +33,10 @@ type HistoryStorage struct {
 	// is their median, over keeps[tag] rounds
 	samples map[string][]Sample
 	keeps   map[string]int
+	// whether the last URL test of a tag with a URL answered, per URL (podkop-engine): a server
+	// may not reach one operator for good (its hoster blocks it), and a URL that answered
+	// through it last time is the one to try once more after the URL of a round did not
+	links map[string]map[string]bool
 }
 
 // Sample is the delay a URL test measured in a round (podkop-engine).
@@ -56,6 +60,7 @@ func NewHistoryStorage() *HistoryStorage {
 		downloads:    make(map[string]DownloadResult),
 		samples:      make(map[string][]Sample),
 		keeps:        make(map[string]int),
+		links:        make(map[string]map[string]bool),
 	}
 }
 
@@ -89,8 +94,35 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	delete(s.downloads, tag)
 	delete(s.samples, tag)
 	delete(s.keeps, tag)
+	delete(s.links, tag)
 	s.notifyUpdated()
 	s.access.Unlock()
+}
+
+// StoreURLTestLinkResult keeps whether a URL test of a tag with link answered (podkop-engine).
+// A failure of the tag as a whole (StoreURLTestFailure) leaves these alone: which URLs answer
+// through a server is still known when it comes back.
+func (s *HistoryStorage) StoreURLTestLinkResult(tag string, link string, answered bool) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	results := s.links[tag]
+	if results == nil {
+		results = make(map[string]bool)
+		s.links[tag] = results
+	}
+	results[link] = answered
+}
+
+// URLTestLinkAnswered tells whether the last URL test of a tag with link answered, and whether
+// one is known at all (podkop-engine).
+func (s *HistoryStorage) URLTestLinkAnswered(tag string, link string) (answered bool, known bool) {
+	if s == nil {
+		return false, false
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	answered, known = s.links[tag][link]
+	return
 }
 
 func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {

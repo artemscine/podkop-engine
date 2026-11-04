@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -151,8 +152,8 @@ func TestFirstHop(t *testing.T) {
 	require.Equal(t, adapter.Outbound(a), firstHop(nil, a))
 }
 
-// The rounds take the URLs in turn by the clock, the next one as the retry; the median is of
-// as many rounds as there are URLs.
+// The rounds take the URLs in turn by the clock, the others after the URL of the round in the
+// order of the list; the median is of as many rounds as there are URLs.
 func TestRoundPlan(t *testing.T) {
 	links := []string{"https://a/", "https://b/", "https://c/"}
 	base := time.Unix(1_800_000_000, 0).Truncate(time.Minute)
@@ -160,9 +161,11 @@ func TestRoundPlan(t *testing.T) {
 	for i := range 4 {
 		plan := roundPlan(links, time.Minute, base.Add(time.Duration(i)*time.Minute+time.Second))
 		require.Equal(t, 3, plan.keep)
-		require.Len(t, plan.links, 2)
+		require.Len(t, plan.links, 3)
+		require.ElementsMatch(t, links, plan.links)
 		seen = append(seen, plan.links[0])
 		require.Equal(t, links[(indexOf(links, plan.links[0])+1)%3], plan.links[1])
+		require.Equal(t, links[(indexOf(links, plan.links[0])+2)%3], plan.links[2])
 	}
 	require.Equal(t, seen[0], seen[3])
 	require.ElementsMatch(t, links, seen[:3])
@@ -173,6 +176,103 @@ func TestRoundPlan(t *testing.T) {
 	require.Equal(t, 1, one.keep)
 	none := roundPlan(nil, time.Minute, base)
 	require.Equal(t, []string{""}, none.links)
+}
+
+// The retry of a round takes the first URL after the one of the round that answered through
+// the member last time, the next one when none did; the confirmation of a member whose
+// connections fail takes the first that answered, from the URL of the round on.
+func TestRetryAndConfirmLinks(t *testing.T) {
+	history := urltest.NewHistoryStorage()
+	plan := probePlan{links: []string{"https://a/", "https://b/", "https://c/", "https://d/"}, keep: 4}
+	require.Equal(t, "https://b/", plan.retryLink(history, "m"), "nothing known: the next one")
+	require.Equal(t, "https://a/", plan.confirmLink(history, "m"), "nothing known: the URL of the round")
+	history.StoreURLTestLinkResult("m", "https://b/", false)
+	history.StoreURLTestLinkResult("m", "https://c/", true)
+	require.Equal(t, "https://c/", plan.retryLink(history, "m"))
+	require.Equal(t, "https://c/", plan.confirmLink(history, "m"))
+	require.Equal(t, "https://b/", plan.retryLink(history, "other"), "per member")
+	history.StoreURLTestLinkResult("m", "https://c/", false)
+	history.StoreURLTestLinkResult("m", "https://d/", false)
+	require.Equal(t, "https://b/", plan.retryLink(history, "m"), "none answered: the next one")
+	history.StoreURLTestLinkResult("m", "https://a/", true)
+	require.Equal(t, "https://a/", plan.confirmLink(history, "m"))
+	// a failure of the member keeps what is known of its URLs; its history going away does not
+	history.StoreURLTestFailure("m", time.Now())
+	_, known := history.URLTestLinkAnswered("m", "https://a/")
+	require.True(t, known)
+	history.DeleteURLTestHistory("m")
+	_, known = history.URLTestLinkAnswered("m", "https://a/")
+	require.False(t, known)
+	require.Equal(t, "", probePlan{links: []string{"https://a/"}, keep: 1}.retryLink(history, "m"))
+
+	// a minority of URLs that did not answer is passed over; most is judged as before
+	five := probePlan{links: []string{"https://0/", "https://1/", "https://2/", "https://3/", "https://4/"}, keep: 5}
+	history.StoreURLTestLinkResult("n", "https://1/", false)
+	history.StoreURLTestLinkResult("n", "https://2/", true)
+	history.StoreURLTestLinkResult("n", "https://3/", false)
+	require.Equal(t, "https://2/", five.retryLink(history, "n"), "two of five failed")
+	require.Equal(t, "https://2/", five.confirmLink(history, "n"))
+	history.StoreURLTestLinkResult("n", "https://4/", false)
+	require.Equal(t, "https://1/", five.retryLink(history, "n"), "three of five failed: the next one")
+	require.Equal(t, "https://0/", five.confirmLink(history, "n"), "three of five failed: the URL of the round")
+}
+
+// A server that reaches no URL of two operators that are neighbours in the list (its hoster
+// blocks both): with the next URL as the retry it was unavailable in one round of each cycle,
+// and the group left it for that round. It costs the first round only, before anything is
+// known of its URLs.
+func TestNeighbourLinksDownCostTheFirstRoundOnly(t *testing.T) {
+	var links []string
+	for i := range 2 {
+		links = append(links, fmt.Sprintf("http://127.0.0.1:1/blocked%d", i))
+	}
+	for range 3 {
+		link, _ := testURL(t, 0)
+		links = append(links, link)
+	}
+	member := newTestMember(C.TypeVLESS, "a", dialWorking)
+	history := urltest.NewHistoryStorage()
+	var unavailable []int
+	for round := range 10 {
+		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
+		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+		if _, ok := result["a"]; !ok {
+			unavailable = append(unavailable, round)
+		}
+	}
+	require.Equal(t, []int{0}, unavailable)
+	// a server that is down fails every URL: unavailable in every round, two tests a round
+	dead := newTestMember(C.TypeVLESS, "dead", dialRefused)
+	for round := range 5 {
+		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
+		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{dead}, plan, time.Minute, true, true, 1)
+		require.NotContains(t, result, "dead")
+		require.Equal(t, int32(2*(round+1)), dead.dials.Load(), "two tests a round")
+	}
+}
+
+// A server that reaches only two URLs of five is judged as before the history of its URLs:
+// unavailable in the rounds where the URL of the round and the next one do not answer.
+func TestMostLinksDownIsJudgedAsBefore(t *testing.T) {
+	var links []string
+	for i := range 3 {
+		links = append(links, fmt.Sprintf("http://127.0.0.1:1/blocked%d", i))
+	}
+	for range 2 {
+		link, _ := testURL(t, 0)
+		links = append(links, link)
+	}
+	member := newTestMember(C.TypeVLESS, "a", dialWorking)
+	history := urltest.NewHistoryStorage()
+	var unavailable []int
+	for round := range 10 {
+		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
+		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+		if _, ok := result["a"]; !ok {
+			unavailable = append(unavailable, round)
+		}
+	}
+	require.Equal(t, []int{0, 1, 5, 6}, unavailable)
 }
 
 func indexOf(links []string, link string) int {

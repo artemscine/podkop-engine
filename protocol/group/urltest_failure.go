@@ -354,8 +354,14 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 			return
 		}
 		start := time.Now()
-		_, err := probeOutbound(g.ctx, roundPlan(g.links, g.interval, time.Now()).links[0], member)
+		// a URL that answered through the member last time: one its server cannot reach
+		// would call it down while its connections fail for another reason
+		link := roundPlan(g.links, g.interval, start).confirmLink(g.history, tag)
+		_, err := probeOutbound(g.ctx, link, member)
 		now := time.Now()
+		if g.ctx.Err() == nil && !g.networkPaused() && !g.networkChangedSince(start) {
+			g.history.StoreURLTestLinkResult(tag, link, err == nil)
+		}
 		g.confirmAccess.Lock()
 		state.running = false
 		if err == nil {

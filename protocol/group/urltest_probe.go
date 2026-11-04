@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -182,9 +183,10 @@ func firstHop(manager adapter.OutboundManager, detour adapter.Outbound) any {
 
 // probePlan is what a round tests its members with (podkop-engine).
 type probePlan struct {
-	// links[0] is the URL of the round; links[1], when there is one, is tried once after a
-	// test with it fails: a member is unavailable when two URLs of the list do not answer
-	// through it, not one (a server's hoster may block one of them)
+	// links are the URLs of the group from the one of the round on, in the order of the list:
+	// links[0] is the URL of the round. A member that does not answer it is tested once more,
+	// with retryLink: a member is unavailable when two URLs of the list do not answer through
+	// it, not one (a server's hoster may block one of them)
 	links []string
 	round int64
 	// keep is how many rounds the delay of a member is the median of
@@ -205,11 +207,62 @@ func roundPlan(links []string, interval time.Duration, now time.Time) probePlan 
 		round = now.UnixNano() / int64(interval)
 	}
 	first := int(round % int64(len(links)))
-	plan := probePlan{links: []string{links[first]}, round: round, keep: len(links)}
-	if len(links) > 1 {
-		plan.links = append(plan.links, links[(first+1)%len(links)])
+	plan := probePlan{links: make([]string, 0, len(links)), round: round, keep: len(links)}
+	for i := range links {
+		plan.links = append(plan.links, links[(first+i)%len(links)])
 	}
 	return plan
+}
+
+// retryLink is the URL a member that did not answer the URL of the round is tested with once
+// more: the first of the others, from the URL of the round on, that answered through the
+// member at its last test with it; the next one when none did or none is known (the first
+// rounds, a member that was down), and when most URLs of the list did not answer through it
+// at their last test (mostFailed). A server that does not reach two operators for good would
+// otherwise fail the URL of the round and the next one in one round of each cycle where the
+// two are neighbours in the list, and the group leave it for a round each time; a server that
+// reaches few of them is judged as before. "" without a second URL.
+func (p probePlan) retryLink(history *urltest.HistoryStorage, tag string) string {
+	if len(p.links) < 2 {
+		return ""
+	}
+	if !p.mostFailed(history, tag) {
+		for _, link := range p.links[1:] {
+			if answered, known := history.URLTestLinkAnswered(tag, link); known && answered {
+				return link
+			}
+		}
+	}
+	return p.links[1]
+}
+
+// confirmLink is the URL of the one test that confirms a member whose connections fail: the
+// first, from the URL of the round on, that answered through the member at its last test with
+// it, the URL of the round when none did or when most did not (mostFailed). A URL the member's
+// server cannot reach would otherwise call a working member down.
+func (p probePlan) confirmLink(history *urltest.HistoryStorage, tag string) string {
+	if !p.mostFailed(history, tag) {
+		for _, link := range p.links {
+			if answered, known := history.URLTestLinkAnswered(tag, link); known && answered {
+				return link
+			}
+		}
+	}
+	return p.links[0]
+}
+
+// mostFailed tells whether more than half of the URLs of the plan did not answer through the
+// member at their last test with it: a minority of URLs its server cannot reach is passed
+// over (retryLink, confirmLink), more is no longer a block of some operators but a server that
+// works badly, or one that was down.
+func (p probePlan) mostFailed(history *urltest.HistoryStorage, tag string) bool {
+	failed := 0
+	for _, link := range p.links {
+		if answered, known := history.URLTestLinkAnswered(tag, link); known && !answered {
+			failed++
+		}
+	}
+	return 2*failed > len(p.links)
 }
 
 // testLinks are the URLs of the tests of a group: urls, or url, without empty and repeated ones;
