@@ -83,6 +83,10 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		}
 		info.Put("now", now)
 		info.Put("all", group.All())
+		// the end of "all" that a delay test of the group leaves out (podkop-engine)
+		if withFallbacks, isURLTest := detour.(interface{ Fallbacks() []string }); isURLTest && len(withFallbacks.Fallbacks()) > 0 {
+			info.Put("fallbacks", withFallbacks.Fallbacks())
+		}
 	}
 	if urlTestGroup, ok := detour.(*group.URLTest); ok {
 		info.Put("member_history", urlTestGroup.MemberHistories())
@@ -237,7 +241,7 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		defer func() {
 			realTag := group.RealTag(proxy, N.NetworkTCP)
 			if err != nil {
-				server.urlTestHistory.DeleteURLTestHistory(realTag)
+				server.urlTestHistory.StoreURLTestFailure(realTag, time.Now())
 			} else {
 				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),

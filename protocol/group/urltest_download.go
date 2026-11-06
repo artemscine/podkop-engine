@@ -169,9 +169,15 @@ func (g *URLTestGroup) downloadStopped(tag string, member adapter.Outbound) bool
 	switch {
 	case err == nil:
 		g.logger.Debug("outbound ", tag, " download test: ", received, " bytes in ", elapsed.Milliseconds(), "ms")
+		g.storeDownload(tag, urltest.DownloadResult{At: time.Now(), Received: received})
 		g.memberTestPassed(tag, start)
 	case errors.Is(err, urltest.ErrDownloadStopped):
 		g.logger.Warn("outbound ", tag, " download test: ", err)
+		// a download cut by the close of the group or a change of the network says nothing of the
+		// member, and after a swap the tag may be another outbound's
+		if g.ctx.Err() == nil && !g.networkChangedSince(start) {
+			g.storeDownload(tag, urltest.DownloadResult{At: time.Now(), Received: received, Stopped: true})
+		}
 		return true
 	default:
 		g.logger.Warn("outbound ", tag, " download test could not run, the member is not held back: ", err)

@@ -21,7 +21,9 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
-// The provider's servers for the fallback (podkop-engine).
+// The provider's servers for the fallback (podkop-engine), also asked by the DNS server of
+// the type provider and by the safety net of a group (transport_provider.go,
+// transport_group.go).
 //
 // They are the DNS servers of the OpenWrt interfaces, taken from netifd over ubus:
 //
@@ -89,9 +91,10 @@ func providersFrom(ctx context.Context) *providerSet {
 type providerSet struct {
 	read func(ctx context.Context) ([]netifdInterface, error)
 
-	access  sync.Mutex
-	reading bool // one read at a time, outside the lock
-	servers []M.Socksaddr
+	access   sync.Mutex
+	reading  bool          // one read at a time, outside the lock
+	readDone chan struct{} // closed when the read in progress ends (listWait)
+	servers  []M.Socksaddr
 	// devices are the devices of the uplinks the queries to the servers are bound to; a
 	// server without one is asked through the dialer of the server (sing-box binds them)
 	devices map[M.Socksaddr]string
@@ -140,10 +143,7 @@ func readUbusInterfaces(ctx context.Context) ([]netifdInterface, error) {
 func (p *providerSet) known(ctx context.Context, logger logger.ContextLogger) bool {
 	p.access.Lock()
 	count := len(p.servers)
-	start := p.rereadDue() && !p.reading
-	if start {
-		p.reading = true
-	}
+	start := p.beginRead()
 	p.access.Unlock()
 	if start {
 		go p.refresh(logger, outputDevice(ctx))
@@ -155,20 +155,65 @@ func (p *providerSet) rereadDue() bool {
 	return p.readAt.IsZero() || ((p.readErr || p.stale) && time.Since(p.readAt) >= providerRetryAfter)
 }
 
+// beginRead reserves the read when it is due and no other one runs; under the lock.
+func (p *providerSet) beginRead() bool {
+	if !p.rereadDue() || p.reading {
+		return false
+	}
+	p.reading = true
+	p.readDone = make(chan struct{})
+	return true
+}
+
 // list returns the provider's servers, reading them again when it is due. While another
 // query reads them, the servers read before are returned.
 func (p *providerSet) list(ctx context.Context, logger logger.ContextLogger) []M.Socksaddr {
 	p.access.Lock()
 	servers := p.servers
-	start := p.rereadDue() && !p.reading
-	if start {
-		p.reading = true
-	}
+	start := p.beginRead()
 	p.access.Unlock()
 	if !start {
 		return servers
 	}
 	return p.refresh(logger, outputDevice(ctx))
+}
+
+// listWait is list for the provider DNS server, which has nothing else to ask: when no
+// server is known yet and another query is reading the list (the first queries after the
+// start or a network reset), it waits for that read instead of failing. ctx is the one of
+// the query, baseCtx carries the services of the box.
+func (p *providerSet) listWait(ctx context.Context, baseCtx context.Context, logger logger.ContextLogger) []M.Socksaddr {
+	servers := p.list(baseCtx, logger)
+	if len(servers) > 0 {
+		return servers
+	}
+	p.access.Lock()
+	if !p.reading {
+		servers = p.servers // the read may have ended since
+		p.access.Unlock()
+		return servers
+	}
+	done := p.readDone
+	p.access.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil
+	}
+	p.access.Lock()
+	defer p.access.Unlock()
+	return p.servers
+}
+
+// snapshot is the list as it is now, each server with the device a query to it is bound to.
+func (p *providerSet) snapshot() []adapter.DNSProviderServer {
+	p.access.Lock()
+	defer p.access.Unlock()
+	servers := make([]adapter.DNSProviderServer, 0, len(p.servers))
+	for _, server := range p.servers {
+		servers = append(servers, adapter.DNSProviderServer{Address: server.AddrPort(), Device: p.devices[server]})
+	}
+	return servers
 }
 
 func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.Socksaddr {
@@ -184,6 +229,10 @@ func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.So
 	p.access.Lock()
 	defer p.access.Unlock()
 	p.reading = false
+	if p.readDone != nil {
+		close(p.readDone)
+		p.readDone = nil
+	}
 	changed := p.readAt.IsZero() || device != p.device || !slices.Equal(servers, p.servers) || !maps.Equal(devices, p.devices)
 	p.servers, p.devices, p.device, p.readAt, p.readErr, p.stale = servers, devices, device, time.Now(), err != nil, false
 	if changed {
@@ -191,15 +240,15 @@ func (p *providerSet) refresh(logger logger.ContextLogger, device string) []M.So
 		if logger != nil {
 			switch {
 			case err != nil:
-				logger.Warn("no provider DNS for the fallback: ", err)
+				logger.Warn("no provider DNS: ", err)
 			case len(servers) == 0 && device != "":
-				logger.Warn("no provider DNS for the fallback on ", device)
+				logger.Warn("no provider DNS on ", device)
 			case len(servers) == 0:
-				logger.Warn("no provider DNS for the fallback: no uplink has DNS servers")
+				logger.Warn("no provider DNS: no uplink has DNS servers")
 			case device != "":
-				logger.Warn("provider DNS for the fallback on ", device, " (", strings.Join(names, ", "), "): ", joinServers(servers))
+				logger.Warn("provider DNS on ", device, " (", strings.Join(names, ", "), "): ", joinServers(servers))
 			default:
-				logger.Warn("provider DNS for the fallback, each through its uplink: ", strings.Join(names, "; "))
+				logger.Warn("provider DNS, each through its uplink: ", strings.Join(names, "; "))
 			}
 		}
 	}
@@ -388,8 +437,8 @@ func ownAddresses() map[netip.Addr]bool {
 	return own
 }
 
-// exchangeProvider asks the provider's servers from fresh sockets through the server's own
-// dialer: the one that answered last, or all of them at once.
+// exchangeProvider asks the provider's servers for the fallback of a server, through the
+// server's own dialer; their answer lives fallbackMaxTTL at most.
 func (s *fallbackServer) exchangeProvider(ctx context.Context, baseCtx context.Context, logger logger.ContextLogger, message *mDNS.Msg) (*mDNS.Msg, error) {
 	servers := s.providersFor(s.providers.list(baseCtx, logger))
 	if len(servers) == 0 {
@@ -397,12 +446,23 @@ func (s *fallbackServer) exchangeProvider(ctx context.Context, baseCtx context.C
 	}
 	ctx, cancel := context.WithTimeout(ctx, fallbackTimeout)
 	defer cancel()
+	response, err := s.askProviders(ctx, servers, message)
+	if err != nil {
+		return nil, err
+	}
+	return s.providerAnswered(response), nil
+}
+
+// askProviders asks the provider's servers from fresh sockets: the one that answered last
+// alone, else (or when it does not answer in providerBestTimeout) all of them at once; a
+// REFUSED is no answer. The answer is returned as the server gave it.
+func (s *fallbackServer) askProviders(ctx context.Context, servers []M.Socksaddr, message *mDNS.Msg) (*mDNS.Msg, error) {
 	if best, loaded := s.providers.pick(servers); loaded {
 		bestCtx, bestCancel := context.WithTimeout(ctx, providerBestTimeout)
 		response, err := exchangeFresh(bestCtx, fallbackSocketSlots, s.dialerFor(s.providers.deviceOf(best)), best, message)
 		bestCancel()
 		if err == nil && response.Rcode != mDNS.RcodeRefused {
-			return s.providerAnswered(response), nil
+			return response, nil
 		}
 		s.providers.missed(best)
 		if ctx.Err() != nil {
@@ -455,7 +515,7 @@ func (s *fallbackServer) exchangeAll(ctx context.Context, servers []M.Socksaddr,
 			continue
 		}
 		s.providers.chose(answer.server)
-		return s.providerAnswered(answer.response), nil
+		return answer.response, nil
 	}
 	return nil, err
 }

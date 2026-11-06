@@ -38,6 +38,7 @@ var (
 		string(bucketRuleSetChecked),
 		string(bucketRuleSetFile),
 		string(bucketUTLSChoice),
+		string(bucketDetectOutcome),
 		string(bucketRDRC),
 		string(bucketDNSCache),
 	}

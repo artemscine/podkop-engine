@@ -8,6 +8,7 @@
 package sharelink
 
 import (
+	"encoding/json"
 	"errors"
 	"net/url"
 	"sort"
@@ -399,6 +400,11 @@ func (d *decoder) split(rest string) error {
 	for key, value := range d.query {
 		if key == "ech" {
 			// a name and a resolver joined with "+", which form decoding reads as a space
+			continue
+		}
+		if key == "extra" && json.Valid([]byte(value)) {
+			// JSON may hold both in its texts, a browser's User-Agent and a Referer;
+			// a link after it is no JSON
 			continue
 		}
 		if strings.Contains(value, "://") && strings.ContainsAny(value, " \t\r\n") {

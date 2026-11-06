@@ -23,12 +23,26 @@ import (
 type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
-	updateHooks  []*observable.Subscriber[struct{}]
+	// for the block detector (podkop-engine): when the last URL test of a tag failed, while it has
+	// passed none since, and what the last download test of a tag found
+	failures    map[string]time.Time
+	downloads   map[string]DownloadResult
+	updateHooks []*observable.Subscriber[struct{}]
+}
+
+// DownloadResult is what a download test that could run found (podkop-engine).
+type DownloadResult struct {
+	At       time.Time
+	Received int64
+	// the body stopped on the way, after Received bytes
+	Stopped bool
 }
 
 func NewHistoryStorage() *HistoryStorage {
 	return &HistoryStorage{
 		delayHistory: make(map[string]*adapter.URLTestHistory),
+		failures:     make(map[string]time.Time),
+		downloads:    make(map[string]DownloadResult),
 	}
 }
 
@@ -53,9 +67,13 @@ func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory 
 	return s.delayHistory[tag]
 }
 
+// DeleteURLTestHistory forgets all that was found of a tag: it may be another outbound's by now.
+// A failed test is StoreURLTestFailure.
 func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	s.access.Lock()
 	delete(s.delayHistory, tag)
+	delete(s.failures, tag)
+	delete(s.downloads, tag)
 	s.notifyUpdated()
 	s.access.Unlock()
 }
@@ -63,8 +81,50 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
 	s.access.Lock()
 	s.delayHistory[tag] = history
+	delete(s.failures, tag)
 	s.notifyUpdated()
 	s.access.Unlock()
+}
+
+// StoreURLTestFailure takes the result of a tag whose URL test failed away, as
+// DeleteURLTestHistory does, and keeps the time of the failure (podkop-engine).
+func (s *HistoryStorage) StoreURLTestFailure(tag string, at time.Time) {
+	s.access.Lock()
+	delete(s.delayHistory, tag)
+	s.failures[tag] = at
+	s.notifyUpdated()
+	s.access.Unlock()
+}
+
+// LoadURLTestFailure returns when the last URL test of a tag failed, if it has passed none since
+// (podkop-engine).
+func (s *HistoryStorage) LoadURLTestFailure(tag string) (at time.Time, loaded bool) {
+	if s == nil {
+		return
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	at, loaded = s.failures[tag]
+	return
+}
+
+// StoreDownloadResult keeps what a download test of a tag found (podkop-engine).
+func (s *HistoryStorage) StoreDownloadResult(tag string, result DownloadResult) {
+	s.access.Lock()
+	s.downloads[tag] = result
+	s.access.Unlock()
+}
+
+// LoadDownloadResult returns what the last download test of a tag that could run found
+// (podkop-engine).
+func (s *HistoryStorage) LoadDownloadResult(tag string) (result DownloadResult, loaded bool) {
+	if s == nil {
+		return
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	result, loaded = s.downloads[tag]
+	return
 }
 
 func (s *HistoryStorage) notifyUpdated() {

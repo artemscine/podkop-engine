@@ -2,6 +2,7 @@ package group
 
 import (
 	"slices"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
@@ -16,10 +17,11 @@ func (g *URLTestGroup) storeHistory(tag string, history *adapter.URLTestHistory)
 }
 
 func (g *URLTestGroup) deleteHistory(tag string) {
-	g.history.DeleteURLTestHistory(tag)
+	at := time.Now()
+	g.history.StoreURLTestFailure(tag, at)
 	g.checkedMembers.Store(tag, struct{}{})
 	if g.sharedHistory != nil {
-		g.sharedHistory.DeleteURLTestHistory(tag)
+		g.sharedHistory.StoreURLTestFailure(tag, at)
 	}
 }
 
@@ -102,5 +104,13 @@ func (g *URLTestGroup) memberHistories(result map[string][]*adapter.URLTestHisto
 	}
 	for _, member := range members {
 		collect(member)
+	}
+}
+
+// storeDownload publishes detector telemetry without sharing selection evidence.
+func (g *URLTestGroup) storeDownload(tag string, result urltest.DownloadResult) {
+	g.history.StoreDownloadResult(tag, result)
+	if g.sharedHistory != nil {
+		g.sharedHistory.StoreDownloadResult(tag, result)
 	}
 }

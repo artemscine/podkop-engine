@@ -154,7 +154,9 @@ func TestExchangeAll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	response, err := state.exchangeAll(ctx, servers, message)
-	if err != nil || len(response.Answer) != 1 || response.Answer[0].Header().Ttl != fallbackMaxTTL { // capped from 300
+	// as the server gave it: the fallback caps the TTL (exchangeProvider), the provider DNS
+	// server does not
+	if err != nil || len(response.Answer) != 1 || response.Answer[0].Header().Ttl != 300 {
 		t.Fatalf("got %v, %v", response, err)
 	}
 	if best, loaded := state.providers.pick(servers); !loaded || best != good {
@@ -239,12 +241,12 @@ func TestFallbackLogs(t *testing.T) {
 	probeServer(context.Background(), logger, transport, setAside, freshTestQuery())
 
 	for _, message := range []string{
-		"provider DNS for the fallback on wan0 (wan, wan6): 10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53",
-		"provider DNS for the fallback, each through its uplink: wan on wan0: 10.99.0.53, 10.99.0.54; modem on wwan0: 100.64.5.1; wan6 on wan0: fe80::1%wan0, 2a00::53",
+		"provider DNS on wan0 (wan, wan6): 10.99.0.53, 10.99.0.54, fe80::1%wan0, 2a00::53",
+		"provider DNS, each through its uplink: wan on wan0: 10.99.0.53, 10.99.0.54; modem on wwan0: 100.64.5.1; wan6 on wan0: fe80::1%wan0, 2a00::53",
 		"server dns-server falls back to provider DNS when it fails",
 		"no provider DNS fallback for server dns-server: no context",
-		"no provider DNS for the fallback on eth9",
-		"no provider DNS for the fallback: no ubus in tests",
+		"no provider DNS on eth9",
+		"no provider DNS: no ubus in tests",
 		"failed 2 times in a row (timeout), answering from provider DNS 10.99.0.53, fe80::1%eth1 until it is back",
 		"provider DNS does not answer for server dns-server (timeout), no fallback for it for 1m0s",
 		"server dns-server answers again, provider DNS no longer used",

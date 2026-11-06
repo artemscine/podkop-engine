@@ -17,11 +17,13 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mRand "math/rand"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -36,6 +38,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
+	"github.com/sagernet/sing/service"
 
 	utls "github.com/metacubex/utls"
 	"golang.org/x/crypto/hkdf"
@@ -53,6 +56,12 @@ type RealityClientConfig struct {
 	classicFingerprint string
 	// that fingerprint is one the fingerprint fallback has gone on to, not the configured one
 	classicFallback bool
+	// the configured fingerprint name, for the block detector's key when the fallback is off
+	// (podkop-engine); it defaults to "chrome", as the fallback does
+	fingerprint string
+	// what the block detector reads of the server when the fallback is off, shared with the
+	// clones (podkop-engine)
+	outcome *detectOutcomeWriter
 }
 
 // REALITY servers since Xray-core v26.9.8 (XTLS/REALITY@8cdf7bf) take a Client Hello
@@ -63,6 +72,8 @@ const (
 	realityHybridKeyShareNote = "REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share"
 	// what to configure in place of such a fingerprint
 	realityHybridKeyShareAdvice = ", use chrome, firefox, safari, random or randomized"
+	// the text every failed verification begins with
+	realityVerificationFailed = "reality verification failed"
 )
 
 // realityStrangerError is the failure of a handshake with a fingerprint without the
@@ -95,7 +106,7 @@ func checkRealityFingerprint(name string) (classic bool, err error) {
 // handshake itself failed with, if it did. It names the fingerprint that may be the
 // cause, and what to configure in its place when it is the configured one.
 func (e *RealityClientConfig) verificationFailed(cause error) error {
-	text := "reality verification failed"
+	text := realityVerificationFailed
 	if e.classicFingerprint != "" {
 		text += ", possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
 		if !e.classicFallback {
@@ -153,7 +164,11 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	realityConfig := &RealityClientConfig{ctx: ctx, uClient: uClient.(*UTLSClientConfig), publicKey: publicKey, shortID: shortID}
+	realityConfig := &RealityClientConfig{ctx: ctx, uClient: uClient.(*UTLSClientConfig), publicKey: publicKey, shortID: shortID, outcome: new(detectOutcomeWriter)}
+	realityConfig.fingerprint = options.UTLS.Fingerprint
+	if realityConfig.fingerprint == "" {
+		realityConfig.fingerprint = "chrome"
+	}
 	if classicFingerprint {
 		realityConfig.classicFingerprint = options.UTLS.Fingerprint
 		if logger != nil {
@@ -181,6 +196,68 @@ func (e *RealityClientConfig) ServerName() string {
 
 func (e *RealityClientConfig) SetServerName(serverName string) {
 	e.uClient.SetServerName(serverName)
+}
+
+// recordDetectOutcome tells the block detector what this handshake met, used when the uTLS
+// fingerprint fallback is off (the fallback records the outcome itself when on). The key matches
+// the fallback's: the configured fingerprint, the server name, the server (podkop-engine). ctx is
+// the dial's: a deadline of its caller tells nothing of the server.
+func (e *RealityClientConfig) recordDetectOutcome(ctx context.Context, destination M.Socksaddr, handshakeErr error) {
+	cache := service.FromContext[adapter.CacheFile](e.ctx)
+	if cache == nil {
+		return
+	}
+	e.outcome.open(cache, e.fingerprint+" "+e.ServerName()+" "+destination.String())
+	now := time.Now()
+	switch {
+	case handshakeErr == nil:
+		e.outcome.deadlines.Store(0)
+		e.outcome.answered(now, func(byte, string) (byte, string) {
+			return 0, e.fingerprint
+		})
+	case errors.Is(handshakeErr, context.Canceled):
+		// the caller gave up: nothing about the server
+	case errors.Is(handshakeErr, context.DeadlineExceeded) || errors.Is(handshakeErr, os.ErrDeadlineExceeded):
+		if callerEnded(ctx) {
+			// the caller's deadline cut the handshake, such as the end of the round of a group
+			// test: neither counts nor breaks the row
+			return
+		}
+		// one may be a lost ClientHello or a deadline of the caller's
+		if e.outcome.deadlines.Add(1) >= 2 {
+			e.outcome.failed(now, adapter.DetectNoAnswer)
+		}
+	case realityVerificationError(handshakeErr):
+		e.outcome.deadlines.Store(0)
+		e.outcome.failed(now, adapter.DetectFailed)
+	default:
+		// another handshake error is no signal the detector uses, but the server was reached
+		e.outcome.deadlines.Store(0)
+	}
+}
+
+// callerEnded tells whether the caller of a dial has given it up: canceled, or its deadline has
+// come (podkop-engine). The timer of the context closes it a moment after the deadline, and a
+// handshake the deadline cut fails meanwhile, while Err is still nil.
+func callerEnded(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	return hasDeadline && !time.Now().Before(deadline)
+}
+
+// realityVerificationError tells a handshake that ended in a certificate that is not the server's:
+// the verification of REALITY, or of the certificate of the target it passed the connection on to.
+func realityVerificationError(err error) bool {
+	var (
+		stranger         *realityStrangerError
+		unknownAuthority x509.UnknownAuthorityError
+		hostname         x509.HostnameError
+		invalid          x509.CertificateInvalidError
+	)
+	return errors.As(err, &stranger) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalid) ||
+		strings.Contains(err.Error(), realityVerificationFailed)
 }
 
 func (e *RealityClientConfig) NextProtos() []string {
@@ -375,6 +452,8 @@ func (e *RealityClientConfig) Clone() Config {
 		e.shortID,
 		e.classicFingerprint,
 		e.classicFallback,
+		e.fingerprint,
+		e.outcome,
 	}
 }
 
