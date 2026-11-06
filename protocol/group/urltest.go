@@ -53,6 +53,8 @@ type URLTest struct {
 	group                        *URLTestGroup
 	checkAccess                  sync.Mutex
 	interruptExternalConnections bool
+	mode                         string
+	loss                         lossOptions
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
@@ -100,6 +102,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 	}
 	var err error
+	outbound.mode, outbound.loss, err = groupMode(options.Mode, options.LossURL, time.Duration(options.LossInterval),
+		options.LossThreshold, options.BalanceSize, time.Duration(options.BalanceIdle))
+	if err != nil {
+		return nil, err
+	}
 	outbound.downloadLink, err = groupDownloadLink(options.DownloadURL)
 	if err != nil {
 		return nil, err
@@ -138,6 +145,10 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			return err
 		}
 		group.links = s.links
+		group.mode, group.loss = s.mode, s.loss
+		if s.mode == modeBalance {
+			group.balance = newBalancer()
+		}
 		s.group = group
 	case adapter.StartStateStarted:
 		s.group.PostStart()
@@ -253,7 +264,10 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil || s.group.selectionPending(outbound) {
+	balanced, release := s.group.balanced(ctx, N.NetworkName(network))
+	if balanced != nil {
+		outbound = balanced
+	} else if outbound == nil || s.group.selectionPending(outbound) {
 		outbound, _ = s.group.Select(network)
 	}
 	if outbound == nil {
@@ -284,7 +298,10 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 				conn = watched
 			}
 		}
-		return s.group.newUseConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		return s.group.newUseConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx), release), nil
+	}
+	if release != nil {
+		release()
 	}
 	s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, start)
 	return nil, memberError(outbound, err)
@@ -300,7 +317,10 @@ func memberError(member adapter.Outbound, err error) error {
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
 	outbound := s.group.selectedOutboundUDP.Load()
-	if outbound == nil || s.group.selectionPending(outbound) {
+	balanced, release := s.group.balanced(ctx, N.NetworkUDP)
+	if balanced != nil {
+		outbound = balanced
+	} else if outbound == nil || s.group.selectionPending(outbound) {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
 	if outbound == nil {
@@ -308,7 +328,10 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.group.newUsePacketConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		return s.group.newUsePacketConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx), release), nil
+	}
+	if release != nil {
+		release()
 	}
 	s.group.memberFailed(ctx, outbound, N.NetworkUDP, err, time.Time{})
 	return nil, memberError(outbound, err)
@@ -370,6 +393,12 @@ type URLTestGroup struct {
 	// uses are the connections the group dialed that are open, by member (MembersInUse)
 	useAccess sync.Mutex
 	uses      map[adapter.Outbound]int
+	// the mode and its options (urltest_loss.go, urltest_balance.go); the loss probes of a
+	// round run while lossRunning
+	mode        string
+	loss        lossOptions
+	balance     *balancer
+	lossRunning atomic.Bool
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -410,6 +439,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		epoch:                        time.Now(),
 		downloadLink:                 downloadLink,
 		uses:                         make(map[adapter.Outbound]int),
+		mode:                         modeFastest,
 	}
 	group.watchPause(group.pause)
 	return group, nil
@@ -487,6 +517,8 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	var selected adapter.Outbound
+	// in the mode loss the delays compared are weighed by the loss of the members
+	view := g.lossView()
 	switch network {
 	case N.NetworkTCP:
 		selected = g.selectedOutboundTCP.Load()
@@ -498,7 +530,7 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 		tag := RealTag(selected, network)
 		if history := g.history.LoadURLTestHistory(tag); history != nil && (skip == nil || !skip(tag, history)) {
 			minOutbound = selected
-			minDelay = history.Delay
+			minDelay = view.delay(tag, history)
 		}
 	}
 	for _, detour := range g.outbounds {
@@ -510,8 +542,9 @@ func (g *URLTestGroup) selectAmong(network string, skip func(tag string, history
 		if history == nil || (skip != nil && skip(tag, history)) {
 			continue
 		}
-		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
-			minDelay = history.Delay
+		delay := view.delay(tag, history)
+		if minDelay == 0 || int(minDelay) > int(delay)+int(g.tolerance) {
+			minDelay = delay
 			minOutbound = detour
 		}
 	}
@@ -621,6 +654,7 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	result, err := g.urlTestRound(ctx, force, true)
 	g.performUpdateCheck()
+	g.lossRound()
 	return result, err
 }
 
@@ -845,9 +879,9 @@ func (g *URLTestGroup) updateSelection() {
 	if g.closed.Load() {
 		return
 	}
-	if g.downloadLink != "" {
+	if g.selectionMayWait() {
 		// new dials already pass over a member without a test result while the selection
-		// waits (selectionPending), which the download test may make long
+		// waits (selectionPending), which the download test or a loss probe may make long
 		g.closeUnanswered()
 	}
 	var (
@@ -885,7 +919,9 @@ func (g *URLTestGroup) updateSelection() {
 	if g.closed.Load() {
 		return
 	}
-	if updated {
+	g.updateBalance()
+	// the connections of a balance do not go by the choice: a new one moves none of them
+	if updated && g.mode != modeBalance {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
 	if selected {

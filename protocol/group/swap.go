@@ -59,6 +59,10 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 		}
 		g.frozen.Store(kept)
 	}
+	// a balance goes on with its devices: their connections end on the balancer they began on
+	if g.balance != nil && from.balance != nil {
+		g.balance = from.balance
+	}
 	g.hotStart = true
 }
 
@@ -150,12 +154,15 @@ type useConn struct {
 	once sync.Once
 }
 
-func (g *URLTestGroup) newUseConn(member adapter.Outbound, conn net.Conn, isExternal bool) net.Conn {
+func (g *URLTestGroup) newUseConn(member adapter.Outbound, conn net.Conn, isExternal bool, balanced func()) net.Conn {
 	remove := g.interruptGroup.Add(conn, isExternal)
 	release := g.use(member)
 	return &useConn{Conn: conn, done: func() {
 		remove()
 		release()
+		if balanced != nil {
+			balanced()
+		}
 	}}
 }
 
@@ -183,12 +190,15 @@ type usePacketConn struct {
 	once sync.Once
 }
 
-func (g *URLTestGroup) newUsePacketConn(member adapter.Outbound, conn net.PacketConn, isExternal bool) net.PacketConn {
+func (g *URLTestGroup) newUsePacketConn(member adapter.Outbound, conn net.PacketConn, isExternal bool, balanced func()) net.PacketConn {
 	remove := g.interruptGroup.Add(conn, isExternal)
 	release := g.use(member)
 	return &usePacketConn{NetPacketConn: bufio.NewPacketConn(conn), done: func() {
 		remove()
 		release()
+		if balanced != nil {
+			balanced()
+		}
 	}}
 }
 

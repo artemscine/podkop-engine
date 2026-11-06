@@ -37,6 +37,8 @@ type HistoryStorage struct {
 	// may not reach one operator for good (its hoster blocks it), and a URL that answered
 	// through it last time is the one to try once more after the URL of a round did not
 	links map[string]map[string]bool
+	// the loss probes of a tag (podkop-engine)
+	losses map[string]*lossState
 }
 
 // Sample is the delay a URL test measured in a round (podkop-engine).
@@ -61,6 +63,7 @@ func NewHistoryStorage() *HistoryStorage {
 		samples:      make(map[string][]Sample),
 		keeps:        make(map[string]int),
 		links:        make(map[string]map[string]bool),
+		losses:       make(map[string]*lossState),
 	}
 }
 
@@ -95,6 +98,7 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	delete(s.samples, tag)
 	delete(s.keeps, tag)
 	delete(s.links, tag)
+	delete(s.losses, tag)
 	s.notifyUpdated()
 	s.access.Unlock()
 }
