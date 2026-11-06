@@ -9,11 +9,11 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-// Window is the receive buffer a probe connection asks for: the kernel doubles it, and the
-// window it offers stays near 16-24 KB, a dozen segments. On the stand a 1 MB download with
-// it lost nothing on a 25-packet queue and on a 10 Mbit/s line, where a download with the
-// ordinary buffer lost 6-13 %, and still showed a random loss of 1 % as 0.8-1.25 %.
-const Window = 16 << 10
+// Window is the most a probe connection offers its server, about a dozen segments. On the
+// stand a 1 MB download with a window of 16-24 KB lost nothing on a 25-packet queue and on a
+// 10 Mbit/s line, where a download with the ordinary window lost 6-13 %, and still showed a
+// random loss of 1 % as 0.8-1.25 %.
+const Window = 20 << 10
 
 type contextKey struct{}
 
@@ -31,18 +31,16 @@ type Socket struct {
 	restored bool
 }
 
-// restore gives the probe connection a receive buffer as large as the system lets a TCP
-// connection grow to, once the probe has run: a multiplexed transport (gRPC, HTTP/2, xhttp,
-// mux) keeps the connection a probe dialed in its pool and carries other connections over
-// it, which a window of 16 KB would hold to a crawl. The window scale was chosen at the
-// connect by the system maximum, not by the small buffer, so the window can grow again.
-// Called under access.
+// restore lets the window of the probe connection grow again once the probe has run: a
+// multiplexed transport (gRPC, HTTP/2, xhttp, mux) keeps the connection a probe dialed in its
+// pool and carries other connections over it, which a window of 20 KB would hold to a crawl
+// (on the stand, a gRPC server 25 ms away: 7 Mbit/s). Called under access.
 func (s *Socket) restore() {
 	if s.conn == nil || s.restored {
 		return
 	}
 	s.restored = true
-	restoreBuffer(s.conn)
+	restoreWindow(s.conn)
 }
 
 // With returns a context under which the first TCP dial is a probe connection with a
@@ -82,14 +80,14 @@ func (s *Socket) take() bool {
 }
 
 // Dial dials address with dialer. The first dial under the context that connects is the
-// probe connection: its receive buffer is set before the connect, when the window scale is
-// chosen, and its packets are captured from the connect on (no data moves before the
-// connect returns). Every later dial is an ordinary one.
+// probe connection: once it is established its window is clamped to the window of the probe
+// (the kernel's first window is ten segments, below it) and its packets are captured, before
+// any data moves (the client speaks first through a proxy). Every later dial is an ordinary
+// one.
 func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, address string) (net.Conn, error) {
 	if !s.take() {
 		return dialer.DialContext(ctx, network, address)
 	}
-	dialer.Control = appendControl(dialer.Control, s.window)
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
@@ -109,6 +107,10 @@ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, ad
 		return conn, nil
 	}
 	s.conn = tcpConn
+	if s.err = clampWindow(tcpConn, s.window); s.err != nil {
+		// a probe whose window is not held could make its own loss: not counted
+		return conn, nil
+	}
 	s.capture, s.err = startCapture(tcpConn)
 	return conn, nil
 }

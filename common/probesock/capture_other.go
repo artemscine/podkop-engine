@@ -4,15 +4,13 @@ package probesock
 
 import (
 	"net"
-	"syscall"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-// appendControl leaves the dialer as it is: without a capture the probe counts nothing.
-func appendControl(base func(network, address string, conn syscall.RawConn) error, window int) func(network, address string, conn syscall.RawConn) error {
-	return base
+func clampWindow(conn *net.TCPConn, window int) error {
+	return E.New("not supported on this platform")
 }
 
 type connInfo struct {
@@ -34,4 +32,4 @@ func (c *capture) stop() (*counter, int) {
 	return &counter{}, 0
 }
 
-func restoreBuffer(conn *net.TCPConn) {}
+func restoreWindow(conn *net.TCPConn) {}

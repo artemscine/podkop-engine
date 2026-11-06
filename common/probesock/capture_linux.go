@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -22,13 +21,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// appendControl adds to a dialer's control the receive buffer of a probe connection.
-func appendControl(base func(network, address string, conn syscall.RawConn) error, window int) func(network, address string, conn syscall.RawConn) error {
-	return control.Append(base, func(network, address string, conn syscall.RawConn) error {
-		return control.Raw(conn, func(fd uintptr) error {
-			return unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, window)
-		})
+// clampWindow holds the window a connection offers to window bytes: its receive buffer and the
+// clamp of its window. Set once the connection is established and before data moves, it leaves
+// the window scale the connect chose by the system maximum: a buffer set before the connect has
+// the kernel choose the scale by it (tcp_connect_init clamps the window to a buffer the user
+// set), and the window could never grow past 64 KB again. The buffer is set too, not the clamp
+// alone: the kernel's tuning of a buffer the user did not set moves the clamp along with it.
+// The connection keeps the buffer it is given (restoreWindow).
+func clampWindow(conn *net.TCPConn, window int) error {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return control.Raw(raw, func(fd uintptr) error {
+		if err := setBuffer(int(fd), window); err != nil {
+			return err
+		}
+		return unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, window)
 	})
+}
+
+// setBuffer sets the receive buffer of a socket to size bytes (the kernel doubles what it is
+// given, as the bookkeeping counts): SO_RCVBUFFORCE passes over net.core.rmem_max, small on
+// routers, for a process with CAP_NET_ADMIN.
+func setBuffer(fd int, size int) error {
+	if unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, size) == nil {
+		return nil
+	}
+	return unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, size)
 }
 
 var (
@@ -37,7 +57,8 @@ var (
 )
 
 // systemBufferMax is the largest receive buffer the system grows a TCP connection to (the
-// last of net.ipv4.tcp_rmem), 4 MB when it cannot be read.
+// last of net.ipv4.tcp_rmem), 4 MB when it cannot be read: the clamp of a window no tuning
+// reaches.
 func systemBufferMax() int {
 	bufferMaxOnce.Do(func() {
 		bufferMax = 4 << 20
@@ -55,21 +76,13 @@ func systemBufferMax() int {
 	return bufferMax
 }
 
-// restoreBuffer sets the receive buffer of a probe connection to the system maximum: the
-// kernel doubles what it is given, as the maximum counts. SO_RCVBUFFORCE passes over
-// net.core.rmem_max (small on routers) for a process with CAP_NET_ADMIN.
-func restoreBuffer(conn *net.TCPConn) {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return
-	}
-	value := systemBufferMax() / 2
-	_ = control.Raw(raw, func(fd uintptr) error {
-		if unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, value) != nil {
-			return unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, value)
-		}
-		return nil
-	})
+// restoreWindow lets the window of a probe connection grow as far as the system lets a TCP
+// connection's once the probe is done: a multiplexed transport (gRPC, HTTP/2, xhttp, mux) keeps
+// the connection a probe dialed in its pool and carries other connections over it. The buffer
+// stays set (no tuning), at the most the tuning would reach: memory is taken only by data that
+// waits to be read.
+func restoreWindow(conn *net.TCPConn) {
+	_ = clampWindow(conn, systemBufferMax())
 }
 
 type connInfo struct {

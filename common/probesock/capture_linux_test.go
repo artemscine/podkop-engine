@@ -57,13 +57,17 @@ func TestCaptureLoopback(t *testing.T) {
 	defer conn.Close()
 	raw, err := conn.(*net.TCPConn).SyscallConn()
 	require.NoError(t, err)
-	var buffer int
-	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
-		var err error
-		buffer, err = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
-		return err
-	}))
-	require.LessOrEqual(t, buffer, 4*Window)
+	clamp := func() int {
+		var value int
+		require.NoError(t, control.Raw(raw, func(fd uintptr) error {
+			var err error
+			value, err = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP)
+			return err
+		}))
+		return value
+	}
+	// the window of the probe is clamped once the connection is established
+	require.Equal(t, Window, clamp())
 	_, err = conn.Write([]byte{1})
 	require.NoError(t, err)
 	received, err := io.Copy(io.Discard, conn)
@@ -74,13 +78,8 @@ func TestCaptureLoopback(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, result.Dropped)
 	require.Equal(t, int64(size), result.Bytes)
-	// the probe done, the connection may carry other traffic: its buffer is large again
-	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
-		var err error
-		buffer, err = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
-		return err
-	}))
-	require.GreaterOrEqual(t, buffer, systemBufferMax()/2)
+	// the probe done, the connection may carry other traffic: its window may grow again
+	require.Equal(t, systemBufferMax(), clamp())
 	require.Zero(t, result.Lost)
 	require.Zero(t, result.DupBytes)
 	require.Positive(t, result.Segments)
