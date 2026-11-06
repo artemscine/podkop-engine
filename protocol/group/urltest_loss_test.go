@@ -335,3 +335,39 @@ func TestLossModeStoppedDownloadHolds(t *testing.T) {
 	tcp, _ := selectedTags(group)
 	require.Equal(t, "a", tcp)
 }
+
+// A device that moved off a member that went down comes back to it once the member is up and
+// the device has been idle; a busy device stays.
+func TestBalanceReturnsAfterIdle(t *testing.T) {
+	a, b := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
+	urlTest, group := newModeGroup(t, modeBalance, members(a, b), map[string]uint16{"a": 100, "b": 110}, nil)
+	group.loss.balanceIdle = time.Hour
+	target := balanceTarget(t)
+	memberOf := func(source string) string {
+		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
+		require.NoError(t, err)
+		conn.Close()
+		return group.balance.devices[source].member.Tag()
+	}
+	var onB string
+	for i := 1; i < 200 && onB == ""; i++ {
+		if source := fmt.Sprint("10.2.0.", i); memberOf(source) == "b" {
+			onB = source
+		}
+	}
+	require.NotEmpty(t, onB)
+	setResult(group, "b", 0)
+	group.performUpdateCheck()
+	require.Equal(t, "a", memberOf(onB))
+	setResult(group, "b", 110)
+	group.performUpdateCheck()
+	require.Equal(t, "a", memberOf(onB), "not idle yet: it stays")
+	held, err := urlTest.DialContext(sourceContext(onB), N.NetworkTCP, target)
+	require.NoError(t, err)
+	group.loss.balanceIdle = 20 * time.Millisecond
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, "a", memberOf(onB), "busy: it stays")
+	held.Close()
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, "b", memberOf(onB))
+}

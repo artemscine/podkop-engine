@@ -15,11 +15,11 @@ import (
 // The mode balance (podkop-engine).
 //
 // The connections of a group are spread over its best members by their source address: a
-// device keeps the member it was given, so that a site sees one address of it, and a new
-// device is given one by rendezvous hashing over the members of the balance, which moves
-// few devices when a member comes or goes. A device moves to another member only when its
-// own is down, or, once it is out of the balance, when the device has opened no connection
-// for balance_idle. On the stand the balance brought no speed: a device's connections over
+// device keeps the member it was given while it has connections and for balance_idle after,
+// so that a site sees one address of it, and is given one by rendezvous hashing over the
+// members of the balance, which moves few devices when a member comes or goes. A device
+// moves at once only when its member is down; otherwise it is hashed again once it has been
+// idle for balance_idle, which returns it to a member that came back. On the stand the balance brought no speed: a device's connections over
 // two servers went no faster than over one, and a slow member made its devices slow; what
 // it gives is the load of the servers spread, and counts of loss of several of them.
 //
@@ -150,8 +150,11 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
 		device = &balanceDevice{}
 		b.devices[key] = device
 	}
+	// a device busy or idle for less than balance_idle keeps its member while it is up, in the
+	// balance or not; one idle longer is given the member its address falls on now, which
+	// brings the devices back to a member that was down, and spreads them again
 	keep := device.member != nil && slices.Contains(g.outbounds, device.member) && g.memberAlive(device.member) &&
-		(slices.Contains(members, device.member) || device.active > 0 || now.Sub(device.last) < g.loss.balanceIdle)
+		(device.active > 0 || now.Sub(device.last) < g.loss.balanceIdle)
 	member := device.member
 	switch {
 	case keep && slices.Contains(member.Network(), network):
