@@ -4,7 +4,6 @@ import (
 	"context"
 	"hash/fnv"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -92,13 +91,13 @@ func (g *URLTestGroup) updateBalance() {
 	}
 }
 
-// balanceKey is the device a connection comes from: its source address.
-func balanceKey(ctx context.Context, network string) string {
-	key := network
+// balanceKey is the device a connection comes from: its source address, the same for its TCP
+// and its UDP, so that a site sees one address of it over both (HTTPS and QUIC).
+func balanceKey(ctx context.Context) string {
 	if metadata := adapter.ContextFrom(ctx); metadata != nil && metadata.Source.Addr.IsValid() {
-		key += " " + metadata.Source.Addr.Unmap().String()
+		return metadata.Source.Addr.Unmap().String()
 	}
-	return key
+	return ""
 }
 
 // rendezvous is the member of the members the key falls on.
@@ -126,7 +125,7 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
 	if b == nil {
 		return nil, nil
 	}
-	key := balanceKey(ctx, network)
+	key := balanceKey(ctx)
 	now := time.Now()
 	b.access.Lock()
 	defer b.access.Unlock()
@@ -152,12 +151,18 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
 	}
 	keep := device.member != nil && slices.Contains(g.outbounds, device.member) && g.memberAlive(device.member) &&
 		(slices.Contains(members, device.member) || device.active > 0 || now.Sub(device.last) < g.loss.balanceIdle)
-	if !keep {
-		device.member = rendezvous(key, members)
+	member := device.member
+	switch {
+	case keep && slices.Contains(member.Network(), network):
+	case keep:
+		// its member carries no UDP: this connection goes by another, the device keeps its own
+		member = rendezvous(key, members)
+	default:
+		member = rendezvous(key, members)
+		device.member = member
 	}
 	device.active++
 	device.last = now
-	member := device.member
 	var once sync.Once
 	return member, func() {
 		once.Do(func() {
@@ -196,10 +201,7 @@ func (s *URLTest) Balance() []BalanceMember {
 		members[i].Tag = member.Tag()
 		index[member] = i
 	}
-	for key, device := range b.devices {
-		if !strings.HasPrefix(key, N.NetworkTCP) {
-			continue
-		}
+	for _, device := range b.devices {
 		if i, inBalance := index[device.member]; inBalance && device.active > 0 {
 			members[i].Devices++
 		}

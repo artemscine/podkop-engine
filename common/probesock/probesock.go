@@ -66,8 +66,8 @@ func (s *Socket) take() bool {
 	return true
 }
 
-// Dial dials address with dialer. The first dial under the context is the probe
-// connection: its receive buffer is set before the connect, when the window scale is
+// Dial dials address with dialer. The first dial under the context that connects is the
+// probe connection: its receive buffer is set before the connect, when the window scale is
 // chosen, and its packets are captured from the connect on (no data moves before the
 // connect returns). Every later dial is an ordinary one.
 func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, address string) (net.Conn, error) {
@@ -78,6 +78,10 @@ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, ad
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
+		// the next address of the server, dialed after this one, is the probe connection
+		s.access.Lock()
+		s.taken = false
+		s.access.Unlock()
 		return nil, err
 	}
 	connect := time.Since(start)

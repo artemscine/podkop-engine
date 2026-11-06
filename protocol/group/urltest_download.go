@@ -122,8 +122,9 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 			// again, and the candidate may lose its place to the member in use or another
 			switchProbes--
 			probed[tag] = true
-			if _, err := g.probeLoss(tag, candidate, urltest.LossProbeLarge, false); err != nil {
-				// it did not download what the probe asked: not now
+			if _, err := g.probeLoss(tag, candidate, urltest.LossProbeLarge, false); errors.Is(err, urltest.ErrDownloadStopped) {
+				// its download stopped on the way: not now. A probe that could not run (the
+				// URL's status, no body) holds it back from nothing
 				tried[tag] = true
 			}
 			continue

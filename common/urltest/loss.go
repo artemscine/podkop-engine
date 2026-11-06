@@ -53,7 +53,10 @@ type LossSample struct {
 
 // LossProbe downloads size bytes of link through detour over a probe connection and returns
 // what its packets showed. An error wrapping ErrLossNotCounted tells a download that went
-// but could not be counted; another error, a download that did not go.
+// but could not be counted; one wrapping ErrDownloadStopped, a body that began and stopped
+// on the way (the member's failure, as in the download test); another error, a probe that
+// could not run (the URL answered with a status, the dial failed), which proves nothing
+// about the member.
 func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (LossSample, error) {
 	var sample LossSample
 	linkURL, err := url.Parse(link)
@@ -97,8 +100,15 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
 	received, err := io.CopyN(io.Discard, resp.Body, size)
 	sample.Elapsed = time.Since(start)
 	sample.Received = received
-	if err != nil && !(errors.Is(err, io.EOF) && received > 0 && received == resp.ContentLength) {
-		return sample, E.Cause(err, "after ", received, " bytes")
+	if err != nil {
+		switch {
+		case received == 0:
+			return sample, E.Cause(err, "no body")
+		case errors.Is(err, io.EOF):
+			// the whole body, shorter than asked: counted as it is
+		default:
+			return sample, E.Cause(errors.Join(ErrDownloadStopped, err), "after ", received, " bytes")
+		}
 	}
 	result, err := socket.Finish()
 	if err != nil {
