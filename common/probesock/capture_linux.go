@@ -29,21 +29,27 @@ import (
 // alone: the kernel's tuning of a buffer the user did not set moves the clamp along with it.
 // The connection keeps the buffer it is given (restoreWindow).
 func clampWindow(conn *net.TCPConn, window int) error {
+	return holdWindow(conn, window, window)
+}
+
+// holdWindow sets the receive buffer of a connection to buffer bytes (the kernel doubles what it
+// is given, as the bookkeeping counts) and the clamp of its window to window bytes.
+func holdWindow(conn *net.TCPConn, buffer int, window int) error {
 	raw, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
 	return control.Raw(raw, func(fd uintptr) error {
-		if err := setBuffer(int(fd), window); err != nil {
+		if err := setBuffer(int(fd), buffer); err != nil {
 			return err
 		}
 		return unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, window)
 	})
 }
 
-// setBuffer sets the receive buffer of a socket to size bytes (the kernel doubles what it is
-// given, as the bookkeeping counts): SO_RCVBUFFORCE passes over net.core.rmem_max, small on
-// routers, for a process with CAP_NET_ADMIN.
+// setBuffer sets the receive buffer of a socket to size bytes, doubled by the kernel:
+// SO_RCVBUFFORCE passes over net.core.rmem_max, small on routers, for a process with
+// CAP_NET_ADMIN.
 func setBuffer(fd int, size int) error {
 	if unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, size) == nil {
 		return nil
@@ -82,7 +88,8 @@ func systemBufferMax() int {
 // stays set (no tuning), at the most the tuning would reach: memory is taken only by data that
 // waits to be read.
 func restoreWindow(conn *net.TCPConn) {
-	_ = clampWindow(conn, systemBufferMax())
+	// half given, as the kernel doubles it: the buffer the tuning would grow it to at most
+	_ = holdWindow(conn, systemBufferMax()/2, systemBufferMax())
 }
 
 type connInfo struct {

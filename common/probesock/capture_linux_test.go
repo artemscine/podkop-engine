@@ -78,8 +78,16 @@ func TestCaptureLoopback(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, result.Dropped)
 	require.Equal(t, int64(size), result.Bytes)
-	// the probe done, the connection may carry other traffic: its window may grow again
+	// the probe done, the connection may carry other traffic: its window may grow again, its
+	// buffer no larger than the kernel's tuning would make it
 	require.Equal(t, systemBufferMax(), clamp())
+	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
+		buffer, err := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+		if err == nil && buffer > systemBufferMax() {
+			t.Errorf("the buffer is %d, the tuning stops at %d", buffer, systemBufferMax())
+		}
+		return err
+	}))
 	require.Zero(t, result.Lost)
 	require.Zero(t, result.DupBytes)
 	require.Positive(t, result.Segments)
