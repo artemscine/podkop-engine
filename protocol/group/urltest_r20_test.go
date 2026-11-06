@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -72,9 +73,10 @@ func TestBlockFallbackAnswers(t *testing.T) {
 // No more URL tests than probeSlots run at once in the process. Not parallel: the slots are
 // those of the whole process.
 func TestProbeLimit(t *testing.T) {
-	var now, most atomic.Int32
+	var now, most, dials atomic.Int32
 	release := make(chan struct{})
-	slow := newTestMember(C.TypeSOCKS, "slow", func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	slow := func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+		dials.Add(1)
 		running := now.Add(1)
 		defer now.Add(-1)
 		for {
@@ -88,13 +90,15 @@ func TestProbeLimit(t *testing.T) {
 		case <-ctx.Done():
 		}
 		return nil, errors.New("down")
-	})
+	}
 	var done sync.WaitGroup
-	for range 3 * cap(probeSlots) {
+	// members of their own: tests of one member with one URL are one (probes)
+	for i := range 3 * cap(probeSlots) {
+		member := newTestMember(C.TypeSOCKS, "slow"+strconv.Itoa(i), slow)
 		done.Add(1)
 		go func() {
 			defer done.Done()
-			_, _ = testOutbound(context.Background(), "http://www.example.com/generate_204", slow)
+			_, _ = testOutbound(context.Background(), nil, "http://www.example.com/generate_204", member)
 		}()
 	}
 	require.Eventually(t, func() bool { return now.Load() == int32(cap(probeSlots)) }, 5*time.Second, 10*time.Millisecond)
@@ -103,7 +107,7 @@ func TestProbeLimit(t *testing.T) {
 	close(release)
 	done.Wait()
 	require.Equal(t, int32(cap(probeSlots)), most.Load())
-	require.Equal(t, int32(3*cap(probeSlots)), slow.dials.Load())
+	require.Equal(t, int32(3*cap(probeSlots)), dials.Load())
 }
 
 // Before a round has tested the members a fallback is not taken for want of their results: at

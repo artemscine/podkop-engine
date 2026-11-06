@@ -345,11 +345,24 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 	state.running = true
 	g.confirmAccess.Unlock()
 	go func() {
-		start := time.Now()
 		// past probeSlots: one test of a member whose connections fail, paced as above, is
-		// no burst, and behind the rounds it would keep the group on a dead member
-		_, err := probeOutbound(g.ctx, g.link, member)
+		// no burst, and behind the rounds it would keep the group on a dead member. Its first
+		// server is waited for: the members of a dead detour fail all at once.
+		if probes.waitHop(g.ctx, firstHop(g.outbound, member)) != nil {
+			g.confirmAccess.Lock()
+			state.running = false
+			g.confirmAccess.Unlock()
+			return
+		}
+		start := time.Now()
+		// a URL that answered through the member last time: one its server cannot reach
+		// would call it down while its connections fail for another reason
+		link := roundPlan(g.links, g.interval, start).confirmLink(g.history, tag)
+		_, err := probeOutbound(g.ctx, link, member)
 		now := time.Now()
+		if g.ctx.Err() == nil && !g.networkPaused() && !g.networkChangedSince(start) {
+			g.history.StoreURLTestLinkResult(tag, link, err == nil)
+		}
 		g.confirmAccess.Lock()
 		state.running = false
 		if err == nil {
@@ -385,16 +398,11 @@ func (g *URLTestGroup) confirmWith(confirms *map[string]*memberConfirm, tag stri
 // hellos are what operators' DPI freezes, and a small CPU lags under them.
 var probeSlots = make(chan struct{}, 4)
 
-// testOutbound runs one URL test of detour (probeOutbound) once one of probeSlots is free:
-// the wait for the slot does not take the time of the test.
-func testOutbound(ctx context.Context, link string, detour adapter.Outbound) (uint16, error) {
-	select {
-	case probeSlots <- struct{}{}:
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	}
-	defer func() { <-probeSlots }()
-	return probeOutbound(ctx, link, detour)
+// testOutbound runs one URL test of detour (probeOutbound) once one of probeSlots is free and
+// the first server of detour may take a new connection (probes): the waits do not take the
+// time of the test. A test of detour with link another group runs is waited for instead.
+func testOutbound(ctx context.Context, manager adapter.OutboundManager, link string, detour adapter.Outbound) (uint16, error) {
+	return probes.test(ctx, manager, link, detour, probeSlots)
 }
 
 // probeOutbound runs one URL test of detour, bounded by the TCP timeout.

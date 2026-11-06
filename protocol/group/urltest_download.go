@@ -71,15 +71,20 @@ func checkDownloadLink(name string, link string) error {
 }
 
 // selectTested chooses the TCP member as Select does, except that a member the group would
-// switch to first passes the download test. When no candidate passes, a current member
-// with a test result stays; without one, the plain choice is taken: a member frozen after
-// 16 KB carries small requests, a dead one none.
+// switch to first passes the download test, and in the mode loss is first probed for loss
+// when it has no fresh count (podkop-engine): the probe runs in the background and the member
+// in use stays meanwhile; the probe asks for a selection when it is done. When no candidate
+// passes, a current member with a test result stays; without one, the plain choice is taken:
+// a member frozen after 16 KB carries small requests, a dead one none.
 func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
-	if g.downloadLink == "" {
+	if g.downloadLink == "" && g.mode != modeLoss {
 		return g.Select(N.NetworkTCP)
 	}
 	current := g.selectedOutboundTCP.Load()
+	// a member in use that is down is left at once, without a probe, as before
+	currentAlive := current != nil && !g.isFallback(current) && g.memberAlive(current)
 	tried := make(map[string]bool)
+	downloaded := make(map[string]bool)
 	for {
 		candidate, exists := g.selectAmong(N.NetworkTCP, g.skipFrozen(tried))
 		if candidate == nil || !exists {
@@ -98,17 +103,27 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 			// made it a candidate again: it is tested, or it would keep out, by the
 			// tolerance, a member that has recovered meanwhile
 		}
-		start := time.Now()
-		if !g.downloadStopped(tag, candidate) {
+		if g.downloadLink != "" && !downloaded[tag] {
+			start := time.Now()
+			if g.downloadStopped(tag, candidate) {
+				// frozen as of the start of the test: a URL test that passed while the
+				// download ran (the round forced by a network change, which also cut this
+				// download) is a newer result and brings the member back
+				g.setFrozen(tag, start)
+				g.recoveryFailed(tag)
+				tried[tag] = true
+				continue
+			}
 			g.setFrozen(tag, time.Time{})
-			return candidate, true
+			downloaded[tag] = true
 		}
-		// frozen as of the start of the test: a URL test that passed while the download
-		// ran (the round forced by a network change, which also cut this download) is a
-		// newer result and brings the member back
-		g.setFrozen(tag, start)
-		g.recoveryFailed(tag)
-		tried[tag] = true
+		if g.mode == modeLoss && currentAlive && candidate != current && g.needsSwitchProbe(tag) {
+			// the switch waits for a count of the candidate: the member in use stays until the
+			// probe is done, and the selection then runs again with what it counted
+			g.startSwitchProbe(tag, candidate)
+			break
+		}
+		return candidate, true
 	}
 	if current != nil && g.memberHistory(current, N.NetworkTCP) != nil {
 		return current, true
@@ -120,7 +135,13 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 // download check may keep the next selection waiting (one download test per candidate):
 // connections then go by the plain choice instead of a member known to be down.
 func (g *URLTestGroup) selectionPending(selected adapter.Outbound) bool {
-	return g.downloadLink != "" && g.memberHistory(selected, N.NetworkTCP) == nil
+	return g.selectionMayWait() && g.memberHistory(selected, N.NetworkTCP) == nil
+}
+
+// selectionMayWait tells whether a selection may wait for a test of a candidate: the download
+// test (a loss probe runs in the background).
+func (g *URLTestGroup) selectionMayWait() bool {
+	return g.downloadLink != ""
 }
 
 // selectUDP chooses the UDP member as Select does, passing over the members frozen for TCP.
@@ -164,6 +185,10 @@ func (g *URLTestGroup) setFrozen(tag string, at time.Time) {
 func (g *URLTestGroup) downloadStopped(tag string, member adapter.Outbound) bool {
 	ctx, cancel := context.WithTimeout(g.ctx, downloadTestTimeout)
 	defer cancel()
+	// a new connection to the first server of the member, like a URL test (probes)
+	if probes.waitHop(ctx, firstHop(g.outbound, member)) != nil {
+		return false
+	}
 	start := time.Now()
 	received, elapsed, err := urltest.DownloadTest(ctx, g.downloadLink, member)
 	switch {

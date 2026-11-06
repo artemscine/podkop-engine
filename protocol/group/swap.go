@@ -2,6 +2,7 @@ package group
 
 import (
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -44,7 +45,7 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 			sharedTags[member.Tag()] = true
 		}
 	}
-	sameCheck := g.link == from.link
+	sameCheck := slices.Equal(g.links, from.links) && g.interval == from.interval
 	if selected := from.selectedOutboundTCP.Load(); sameCheck && selected != nil && shared[selected] {
 		g.selectedOutboundTCP.Store(selected)
 	}
@@ -65,9 +66,10 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 	if sameCheck {
 		for member := range shared {
 			for _, network := range member.Network() {
-				if history := from.memberHistory(member, network); history != nil {
-					g.history.StoreURLTestHistory(RealTag(member, network), history)
-					g.checkedMembers.Store(RealTag(member, network), struct{}{})
+				tag := RealTag(member, network)
+				g.history.CopyMemberFrom(from.history, tag, true, g.downloadLink == from.downloadLink, g.loss.link == from.loss.link)
+				if _, checked := from.checkedMembers.Load(tag); checked {
+					g.checkedMembers.Store(tag, struct{}{})
 				}
 			}
 		}
@@ -80,6 +82,10 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 			}
 		}
 		g.fallbackRecovery.takeOver(from.fallbackRecovery, proofTags)
+	}
+	// a balance goes on with its devices: their connections end on the balancer they began on
+	if sameCheck && g.mode == from.mode && g.loss == from.loss {
+		g.takeBalance(from)
 	}
 	g.hotStart = true
 }
@@ -172,12 +178,15 @@ type useConn struct {
 	once sync.Once
 }
 
-func (g *URLTestGroup) newUseConn(member adapter.Outbound, conn net.Conn, isExternal bool) net.Conn {
+func (g *URLTestGroup) newUseConn(member adapter.Outbound, conn net.Conn, isExternal bool, balanced func()) net.Conn {
 	remove := g.interruptGroup.Add(conn, isExternal)
 	release := g.use(member)
 	return &useConn{Conn: conn, done: func() {
 		remove()
 		release()
+		if balanced != nil {
+			balanced()
+		}
 	}}
 }
 
@@ -205,12 +214,15 @@ type usePacketConn struct {
 	once sync.Once
 }
 
-func (g *URLTestGroup) newUsePacketConn(member adapter.Outbound, conn net.PacketConn, isExternal bool) net.PacketConn {
+func (g *URLTestGroup) newUsePacketConn(member adapter.Outbound, conn net.PacketConn, isExternal bool, balanced func()) net.PacketConn {
 	remove := g.interruptGroup.Add(conn, isExternal)
 	release := g.use(member)
 	return &usePacketConn{NetPacketConn: bufio.NewPacketConn(conn), done: func() {
 		remove()
 		release()
+		if balanced != nil {
+			balanced()
+		}
 	}}
 }
 

@@ -47,7 +47,7 @@ type URLTest struct {
 	fallbackFastest              bool
 	fallbackTags                 []string
 	all                          []string
-	link                         string
+	links                        []string
 	downloadLink                 string
 	interval                     time.Duration
 	tolerance                    uint16
@@ -55,6 +55,8 @@ type URLTest struct {
 	group                        *URLTestGroup
 	checkAccess                  sync.Mutex
 	interruptExternalConnections bool
+	mode                         string
+	loss                         lossOptions
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
@@ -76,7 +78,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		recoveryOptions:              options.FallbackRecovery,
 		fallbackFastest:              options.FallbackSelection == "fastest",
 		all:                          all,
-		link:                         options.URL,
+		links:                        testLinks(options),
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
@@ -104,7 +106,17 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 			listed[member] = true
 		}
 	}
+	for _, link := range outbound.links {
+		if err := checkTestLink(link); err != nil {
+			return nil, err
+		}
+	}
 	var err error
+	outbound.mode, outbound.loss, err = groupMode(options.Mode, options.LossURL, time.Duration(options.LossInterval),
+		options.LossThreshold, options.BalanceSize, time.Duration(options.BalanceIdle))
+	if err != nil {
+		return nil, err
+	}
 	outbound.downloadLink, err = groupDownloadLink(options.DownloadURL)
 	if err != nil {
 		return nil, err
@@ -138,12 +150,17 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			fallbacks = append(fallbacks, detour)
 		}
-		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, fallbacks, s.link, s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, fallbacks, "", s.downloadLink, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 		if err != nil {
 			return err
 		}
 		group.fallbackRecovery = newFallbackRecovery(s.recoveryOptions)
 		group.fallbackFastest = s.fallbackFastest
+		group.links = s.links
+		group.mode, group.loss = s.mode, s.loss
+		if s.mode == modeBalance {
+			group.balance.Store(newBalancer())
+		}
 		s.group = group
 	case adapter.StartStateStarted:
 		s.group.PostStart()
@@ -202,6 +219,13 @@ func (s *URLTest) References() []string {
 	if selectedUDP != nil && selectedUDP != selectedTCP {
 		references = append(references, selectedUDP.Tag())
 	}
+	// the members of a balance carry connections too (podkop-engine): their idle connections
+	// are kept as the choice's are
+	for _, tag := range group.balanceReferences() {
+		if !slices.Contains(references, tag) {
+			references = append(references, tag)
+		}
+	}
 	return references
 }
 
@@ -259,7 +283,10 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil || s.group.selectionPending(outbound) {
+	balanced, release := s.group.balanced(ctx, N.NetworkName(network))
+	if balanced != nil {
+		outbound = balanced
+	} else if outbound == nil || s.group.selectionPending(outbound) {
 		outbound, _ = s.group.Select(network)
 	}
 	if outbound == nil {
@@ -290,7 +317,10 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 				conn = watched
 			}
 		}
-		return s.group.newUseConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		return s.group.newUseConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx), release), nil
+	}
+	if release != nil {
+		release()
 	}
 	s.group.memberFailed(ctx, outbound, N.NetworkName(network), err, start)
 	return nil, memberError(outbound, err)
@@ -306,7 +336,10 @@ func memberError(member adapter.Outbound, err error) error {
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
 	outbound := s.group.selectedOutboundUDP.Load()
-	if outbound == nil || s.group.selectionPending(outbound) {
+	balanced, release := s.group.balanced(ctx, N.NetworkUDP)
+	if balanced != nil {
+		outbound = balanced
+	} else if outbound == nil || s.group.selectionPending(outbound) {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
 	if outbound == nil {
@@ -314,7 +347,10 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.group.newUsePacketConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		return s.group.newUsePacketConn(outbound, conn, interrupt.IsExternalConnectionFromContext(ctx), release), nil
+	}
+	if release != nil {
+		release()
 	}
 	s.group.memberFailed(ctx, outbound, N.NetworkUDP, err, time.Time{})
 	return nil, memberError(outbound, err)
@@ -329,7 +365,7 @@ type URLTestGroup struct {
 	outbounds                    []adapter.Outbound
 	fallbacks                    []adapter.Outbound
 	members                      []adapter.Outbound // the outbounds, then the fallbacks: what a round tests
-	link                         string
+	links                        []string           // the URLs of the tests, one a round in turn (roundPlan)
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
@@ -380,6 +416,14 @@ type URLTestGroup struct {
 	// uses are the connections the group dialed that are open, by member (MembersInUse)
 	useAccess sync.Mutex
 	uses      map[adapter.Outbound]int
+	// the mode and its options (urltest_loss.go, urltest_balance.go); the loss probes of a
+	// round run while lossRunning
+	mode         string
+	loss         lossOptions
+	balance      atomic.Pointer[balancer]
+	lossRunning  atomic.Bool
+	switchProbes sync.Map // member tag → a probe before a switch to it runs
+	switchProbed sync.Map // member tag → when the last probe before a switch to it began
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -408,7 +452,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		outbounds:                    outbounds,
 		fallbacks:                    fallbacks,
 		members:                      slices.Concat(outbounds, fallbacks),
-		link:                         link,
+		links:                        linkList(link),
 		interval:                     interval,
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
@@ -421,6 +465,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		epoch:                        time.Now(),
 		downloadLink:                 downloadLink,
 		uses:                         make(map[adapter.Outbound]int),
+		mode:                         modeFastest,
 	}
 	group.watchPause(group.pause)
 	return group, nil
@@ -511,6 +556,8 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	var selected adapter.Outbound
+	// in the mode loss the delays compared are weighed by the loss of the members
+	view := g.lossView()
 	switch network {
 	case N.NetworkTCP:
 		selected = g.selectedOutboundTCP.Load()
@@ -522,7 +569,7 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 		tag := RealTag(selected, network)
 		if history := g.memberHistory(selected, network); history != nil && (!confirmed || g.fallbackRecovered(tag)) && (skip == nil || !skip(tag, history)) {
 			minOutbound = selected
-			minDelay = history.Delay
+			minDelay = view.delay(tag, history)
 		}
 	}
 	for _, detour := range g.outbounds {
@@ -534,8 +581,9 @@ func (g *URLTestGroup) selectRecoveryAmong(network string, skip func(tag string,
 		if history == nil || (confirmed && !g.fallbackRecovered(tag)) || (skip != nil && skip(tag, history)) {
 			continue
 		}
-		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
-			minDelay = history.Delay
+		delay := view.delay(tag, history)
+		if minDelay == 0 || int(minDelay) > int(delay)+int(g.tolerance) {
+			minDelay = delay
 			minOutbound = detour
 		}
 	}
@@ -675,6 +723,7 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	result, err := g.urlTestRound(ctx, force, true)
 	g.performUpdateCheck()
+	g.lossRound()
 	return result, err
 }
 
@@ -706,7 +755,7 @@ func (g *URLTestGroup) urlTestMembers(ctx context.Context, members []adapter.Out
 			go g.CheckOutbounds(g.ctx, true)
 		}
 	}()
-	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, g.link, g.interval, force, wait, concurrency, g)
+	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, members, roundPlan(g.links, g.interval, time.Now()), g.interval, force, wait, concurrency, g)
 	if ctx.Err() == nil {
 		// a round cut short (a delay test of the Clash API that timed out) tested only some
 		g.roundDone.Store(true)
@@ -739,13 +788,14 @@ type urlTestBatch struct {
 // choice. Without, the selection runs after the call returns: the Clash API answers its
 // client in time, while the selection may run a download test of up to 15 s per candidate.
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool) map[string]uint16 {
-	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, wait, urlTestConcurrency, nil)
+	// a test the Clash API asks for has its own URL, and the delay it stores is the one measured
+	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, probePlan{links: []string{link}}, interval, force, wait, urlTestConcurrency, nil)
 }
 
 // urlTestConcurrency is how many outbounds a round tests at a time.
 const urlTestConcurrency = 10
 
-func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, wait bool, concurrency int, owner *URLTestGroup) map[string]uint16 {
+func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, plan probePlan, interval time.Duration, force bool, wait bool, concurrency int, owner *URLTestGroup) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
 	testBatch := &urlTestBatch{
 		owner:    owner,
@@ -758,7 +808,7 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		wait:     wait,
 		result:   make(map[string]uint16),
 	}
-	testBatch.test(outbounds, link, interval, force)
+	testBatch.test(outbounds, plan, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := MemberHistory(history, outboundGroup, N.NetworkTCP)
@@ -767,6 +817,19 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		}
 	}
 	return testBatch.result
+}
+
+// storeLinkResult keeps whether a test of a round with link answered through the member tag
+// (retryLink, confirmLink): not for a test the Clash API asked for with its own URL, nor for one
+// the end of the round or of the group cut short, which proves nothing of the URL.
+func (b *urlTestBatch) storeLinkResult(plan probePlan, tag string, link string, err error, started time.Time) {
+	if plan.keep == 0 || roundEnded(b.ctx) {
+		return
+	}
+	if owner := b.owner; owner != nil && (owner.ctx.Err() != nil || owner.networkChangedSince(started) || (err != nil && (owner.networkPaused() || localNetworkError(err)))) {
+		return
+	}
+	b.history.StoreURLTestLinkResult(tag, link, err == nil)
 }
 
 // roundEnded tells whether the round of ctx is over (podkop-engine): canceled, or its deadline
@@ -783,7 +846,7 @@ func roundEnded(ctx context.Context) bool {
 	return hasDeadline && !time.Now().Before(deadline)
 }
 
-func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
+func (b *urlTestBatch) test(outbounds []adapter.Outbound, plan probePlan, interval time.Duration, force bool) {
 	for _, detour := range outbounds {
 		tag := detour.Tag()
 		if b.checked[tag] || detour.Type() == C.TypeBlock {
@@ -813,7 +876,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.test(common.FilterNotNil(common.Map(nested.All(), func(it string) adapter.Outbound {
 				member, _ := b.outbound.Outbound(it)
 				return member
-			})), link, interval, force)
+			})), plan, interval, force)
 		default:
 			// A member that some group tested within this round is not tested again. The
 			// group's own test from the previous round must not count: it finished at most
@@ -827,9 +890,21 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.batch.Go(tag, func() (any, error) {
 				var testResult urlTestResult
 				started := time.Now()
-				testResult.delay, testResult.err = testOutbound(b.ctx, link, detour)
+				testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, plan.links[0], detour)
+				b.storeLinkResult(plan, tag, plan.links[0], testResult.err, started)
+				if testResult.err != nil && !roundEnded(b.ctx) {
+					// one URL that does not answer through a member is not the member down
+					if retry := plan.retryLink(b.history, tag); retry != "" {
+						b.logger.Debug("outbound ", tag, " did not answer ", plan.links[0], ": ", testResult.err, "; trying ", retry)
+						testResult.delay, testResult.err = testOutbound(b.ctx, b.outbound, retry, detour)
+						b.storeLinkResult(plan, tag, retry, testResult.err, started)
+					}
+				}
+				// a test the Clash API asked for (plan.keep 0) leaves a member whose delay is the
+				// median of the rounds as it is: one test with the URL of the client is no round
+				byClient := plan.keep == 0 && b.history.URLTestSmoothed(tag)
 				owner := b.owner
-				if owner != nil && owner.fallbackRecovery != nil {
+				if owner != nil {
 					if roundEnded(b.ctx) || owner.ctx.Err() != nil || owner.networkChangedSince(started) || (testResult.err != nil && owner.networkPaused()) {
 						return nil, nil
 					}
@@ -837,14 +912,16 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						owner.afterLocalFailure(tag, func() { owner.deleteHistory(tag); owner.recoveryFailed(tag); owner.requestUpdateCheck() })
 						return nil, nil
 					}
-					if testResult.err != nil {
-						owner.recoveryFailed(tag)
-					} else {
-						owner.fallbackRecovery.answered(tag, time.Now(), owner.interval)
+					if owner.fallbackRecovery != nil {
+						if testResult.err != nil {
+							owner.recoveryFailed(tag)
+						} else {
+							owner.fallbackRecovery.answered(tag, time.Now(), owner.interval)
+						}
 					}
 				}
 				if testResult.err != nil {
-					if roundEnded(b.ctx) {
+					if roundEnded(b.ctx) || byClient {
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
@@ -853,22 +930,30 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 					} else {
 						b.history.StoreURLTestFailure(tag, time.Now())
 					}
+				} else if byClient {
+					b.access.Lock()
+					b.result[tag] = testResult.delay
+					b.access.Unlock()
 				} else {
 					if b.ctx.Err() != nil {
 						// the round ended with its group (podkop-engine): the tag may be
 						// another outbound's by now
 						return nil, nil
 					}
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					history := &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
+					delay := testResult.delay
+					if plan.keep > 0 {
+						delay = b.history.StoreURLTestSample(tag, plan.round, plan.keep, delay)
+						b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms, the median of the last ", plan.keep, " rounds ", delay, "ms")
+					} else {
+						b.logger.Debug("outbound ", tag, " available: ", delay, "ms")
 					}
+					history := &adapter.URLTestHistory{Time: time.Now(), Delay: delay}
 					if owner != nil {
 						owner.storeHistory(tag, history)
 					} else {
 						b.history.StoreURLTestHistory(tag, history)
 					}
+					testResult.delay = delay
 					b.access.Lock()
 					b.result[tag] = testResult.delay
 					b.access.Unlock()
@@ -892,7 +977,7 @@ func (g *URLTestGroup) updateSelection() {
 	if g.closed.Load() {
 		return
 	}
-	if g.downloadLink != "" {
+	if g.selectionMayWait() {
 		// new dials already pass over a member without a test result while the selection
 		// waits (selectionPending), which the download test may make long
 		g.closeUnanswered()
@@ -932,7 +1017,9 @@ func (g *URLTestGroup) updateSelection() {
 	if g.closed.Load() {
 		return
 	}
-	if updated {
+	g.updateBalance()
+	// the connections of a balance do not go by the choice: a new one moves none of them
+	if updated && g.mode != modeBalance {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
 	if selected {

@@ -76,6 +76,17 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	} else {
 		info.Put("history", []*adapter.URLTestHistory{})
 	}
+	if loss := lossInfo(server.urlTestHistory, group.RealTag(detour, N.NetworkTCP)); loss != nil {
+		info.Put("loss", loss)
+	}
+	if urlTest, isURLTest := detour.(*group.URLTest); isURLTest {
+		if mode := urlTest.Mode(); mode != "fastest" {
+			info.Put("mode", mode)
+		}
+		if balance := urlTest.Balance(); balance != nil {
+			info.Put("balance", balance)
+		}
+	}
 	if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
 		var now string
 		if selected := group.Selected(N.NetworkTCP); selected != nil {
@@ -90,6 +101,36 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	}
 	if urlTestGroup, ok := detour.(*group.URLTest); ok {
 		info.Put("member_history", urlTestGroup.MemberHistories())
+	}
+	return &info
+}
+
+// lossInfo is what the loss probes of a tag counted (podkop-engine): the probes, segments
+// and lost segments over the last 1, 3, 6, 12 and 24 hours, the least RTT, and when a probe
+// last could not count; nil when there was no probe.
+func lossInfo(history *urltest.HistoryStorage, tag string) *badjson.JSONObject {
+	now := time.Now()
+	windows := history.LossWindows(tag, now)
+	notCounted := history.LossNotCounted(tag)
+	if len(windows) == 0 && notCounted.IsZero() {
+		return nil
+	}
+	var info badjson.JSONObject
+	list := make([]map[string]any, 0, len(windows))
+	for _, window := range windows {
+		list = append(list, map[string]any{
+			"hours":    window.Hours,
+			"probes":   window.Probes,
+			"segments": window.Segments,
+			"lost":     window.Lost,
+		})
+	}
+	info.Put("windows", list)
+	if rtt := history.LossRTT(tag, now); rtt > 0 {
+		info.Put("rtt", rtt.Milliseconds())
+	}
+	if !notCounted.IsZero() {
+		info.Put("not_counted", notCounted)
 	}
 	return &info
 }
@@ -240,9 +281,13 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		delay, err := urltest.URLTest(ctx, url, proxy)
 		defer func() {
 			realTag := group.RealTag(proxy, N.NetworkTCP)
-			if err != nil {
+			switch {
+			case server.urlTestHistory.URLTestSmoothed(realTag):
+				// a member whose delay is the median of the rounds of its groups keeps it: one
+				// test with the URL of the client is no round (podkop-engine)
+			case err != nil:
 				server.urlTestHistory.StoreURLTestFailure(realTag, time.Now())
-			} else {
+			default:
 				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: delay,

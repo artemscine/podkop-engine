@@ -12,7 +12,7 @@ func (g *URLTestGroup) storeHistory(tag string, history *adapter.URLTestHistory)
 	g.history.StoreURLTestHistory(tag, history)
 	g.checkedMembers.Store(tag, struct{}{})
 	if g.sharedHistory != nil {
-		g.sharedHistory.StoreURLTestHistory(tag, history)
+		g.sharedHistory.CopyMemberFrom(g.history, tag, true, false, false)
 	}
 }
 
@@ -113,4 +113,26 @@ func (g *URLTestGroup) storeDownload(tag string, result urltest.DownloadResult) 
 	if g.sharedHistory != nil {
 		g.sharedHistory.StoreDownloadResult(tag, result)
 	}
+}
+
+func (g *URLTestGroup) storeLossSample(tag string, sample urltest.LossSample) {
+	g.history.StoreLossSample(tag, sample)
+	if g.sharedHistory != nil {
+		g.sharedHistory.StoreLossSample(tag, sample)
+	}
+}
+
+func (g *URLTestGroup) storeLossNotCounted(tag string, at time.Time) {
+	g.history.StoreLossNotCounted(tag, at)
+	if g.sharedHistory != nil {
+		g.sharedHistory.StoreLossNotCounted(tag, at)
+	}
+}
+
+func (g *URLTestGroup) storeLossFailure(tag string, at time.Time) int {
+	failures := g.history.StoreLossFailure(tag, at)
+	if g.sharedHistory != nil {
+		g.sharedHistory.StoreLossFailure(tag, at)
+	}
+	return failures
 }
