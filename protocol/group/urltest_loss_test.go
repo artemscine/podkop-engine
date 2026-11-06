@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/probesock"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -59,8 +61,19 @@ func storeLoss(group *URLTestGroup, tag string, segments, lost int, rtt time.Dur
 	group.history.StoreLossSample(tag, urltest.LossSample{At: time.Now(), Received: urltest.LossProbeLarge, Segments: segments, Lost: lost, RTT: rtt})
 }
 
+// formattingLogger is a real logger at the debug level: it panics on argument types it does
+// not format, which the logger of no output never does.
+func formattingLogger(t *testing.T) log.ContextLogger {
+	factory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, io.Discard, "", nil, false)
+	factory.SetLevel(log.LevelDebug)
+	require.NoError(t, factory.Start())
+	t.Cleanup(func() { factory.Close() })
+	return factory.NewLogger("outbound/urltest[test]")
+}
+
 func newModeGroup(t *testing.T, mode string, outbounds []adapter.Outbound, delays map[string]uint16, prepare func(group *URLTestGroup)) (*URLTest, *URLTestGroup) {
 	urlTest, group := newTestFallbackGroup(t, "", "", outbounds, nil, nil)
+	group.logger = formattingLogger(t)
 	var err error
 	group.mode, group.loss, err = groupMode(mode, "http://127.0.0.1:1/loss", 0, 0, 0, 0)
 	require.NoError(t, err)

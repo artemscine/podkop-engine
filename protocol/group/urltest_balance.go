@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,7 +88,7 @@ func (g *URLTestGroup) updateBalance() {
 		for i, member := range tcp {
 			tags[i] = member.Tag()
 		}
-		g.logger.Info("balance over ", len(tags), " outbounds: ", tags)
+		g.logger.Info("balance over ", len(tags), " outbounds: ", strings.Join(tags, ", "))
 	}
 }
 
