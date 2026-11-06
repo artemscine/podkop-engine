@@ -74,6 +74,13 @@ func TestCaptureLoopback(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, result.Dropped)
 	require.Equal(t, int64(size), result.Bytes)
+	// the probe done, the connection may carry other traffic: its buffer is large again
+	require.NoError(t, control.Raw(raw, func(fd uintptr) error {
+		var err error
+		buffer, err = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+		return err
+	}))
+	require.GreaterOrEqual(t, buffer, systemBufferMax()/2)
 	require.Zero(t, result.Lost)
 	require.Zero(t, result.DupBytes)
 	require.Positive(t, result.Segments)

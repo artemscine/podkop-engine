@@ -26,10 +26,12 @@ func tcpInfo(conn *net.TCPConn) (connInfo, error) {
 
 type capture struct{}
 
-func startCapture(conn *net.TCPConn, window time.Duration) (*capture, error) {
+func startCapture(conn *net.TCPConn) (*capture, error) {
 	return nil, E.New("the capture is not supported on this platform")
 }
 
-func (c *capture) stop() (Counts, int) {
-	return Counts{}, 0
+func (c *capture) stop() (*counter, int) {
+	return &counter{}, 0
 }
+
+func restoreBuffer(conn *net.TCPConn) {}

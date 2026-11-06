@@ -43,13 +43,23 @@ type hole struct {
 	at         time.Time
 }
 
+// fill is a piece of a hole a packet filled: how long the hole had been open, and its bytes.
+// The pieces are told apart (reordering or loss) only at the end, by the least RTT of the
+// connection: the time of its connect, which a busy host or server stretches, would call
+// retransmissions reordering.
+type fill struct {
+	packet int
+	age    time.Duration
+	bytes  int64
+}
+
 // counter follows the incoming sequence of one connection, packet by packet.
 type counter struct {
-	window  time.Duration
 	started bool
 	base    uint32
 	highest int64
 	holes   []hole
+	fills   []fill
 	Counts
 }
 
@@ -79,7 +89,6 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
 	}
 	limit := min(end, c.highest)
 	covered := int64(0)
-	filledLate := false
 	kept := c.holes[:0]
 	for _, h := range c.holes {
 		from, to := max(start, h.start), min(limit, h.end)
@@ -88,12 +97,7 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
 			continue
 		}
 		covered += to - from
-		if at.Sub(h.at) < c.window {
-			c.ReorderBytes += to - from
-		} else {
-			c.LostBytes += to - from
-			filledLate = true
-		}
+		c.fills = append(c.fills, fill{packet: c.Packets, age: at.Sub(h.at), bytes: to - from})
 		if h.start < from {
 			kept = append(kept, hole{h.start, from, h.at})
 		}
@@ -102,21 +106,31 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
 		}
 	}
 	c.holes = kept
-	if filledLate {
-		c.LostFills++
-	}
 	c.DupBytes += (limit - start) - covered
 	if end > c.highest {
 		c.highest = end
 	}
 }
 
-// finish returns the counts of the connection so far.
-func (c *counter) finish() Counts {
+// finish returns the counts of the connection so far, the holes filled within window
+// counted as reordering, the others as loss.
+func (c *counter) finish(window time.Duration) Counts {
 	counts := c.Counts
 	counts.Bytes = c.highest
 	for _, h := range c.holes {
 		counts.Unfilled += h.end - h.start
+	}
+	lastLate := -1
+	for _, piece := range c.fills {
+		if piece.age < window {
+			counts.ReorderBytes += piece.bytes
+			continue
+		}
+		counts.LostBytes += piece.bytes
+		if piece.packet != lastLate {
+			counts.LostFills++
+			lastLate = piece.packet
+		}
 	}
 	return counts
 }

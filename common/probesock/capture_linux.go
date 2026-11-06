@@ -6,6 +6,9 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +28,47 @@ func appendControl(base func(network, address string, conn syscall.RawConn) erro
 		return control.Raw(conn, func(fd uintptr) error {
 			return unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, window)
 		})
+	})
+}
+
+var (
+	bufferMaxOnce sync.Once
+	bufferMax     int
+)
+
+// systemBufferMax is the largest receive buffer the system grows a TCP connection to (the
+// last of net.ipv4.tcp_rmem), 4 MB when it cannot be read.
+func systemBufferMax() int {
+	bufferMaxOnce.Do(func() {
+		bufferMax = 4 << 20
+		content, err := os.ReadFile("/proc/sys/net/ipv4/tcp_rmem")
+		if err != nil {
+			return
+		}
+		fields := strings.Fields(string(content))
+		if len(fields) == 3 {
+			if value, err := strconv.Atoi(fields[2]); err == nil && value > 0 {
+				bufferMax = value
+			}
+		}
+	})
+	return bufferMax
+}
+
+// restoreBuffer sets the receive buffer of a probe connection to the system maximum: the
+// kernel doubles what it is given, as the maximum counts. SO_RCVBUFFORCE passes over
+// net.core.rmem_max (small on routers) for a process with CAP_NET_ADMIN.
+func restoreBuffer(conn *net.TCPConn) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	value := systemBufferMax() / 2
+	_ = control.Raw(raw, func(fd uintptr) error {
+		if unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, value) != nil {
+			return unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, value)
+		}
+		return nil
 	})
 }
 
@@ -71,7 +115,7 @@ type capture struct {
 	inIndex int // the interface the incoming packets are taken from: the first one seen
 }
 
-func startCapture(conn *net.TCPConn, window time.Duration) (*capture, error) {
+func startCapture(conn *net.TCPConn) (*capture, error) {
 	local, err := netip.ParseAddrPort(conn.LocalAddr().String())
 	if err != nil {
 		return nil, err
@@ -88,7 +132,6 @@ func startCapture(conn *net.TCPConn, window time.Duration) (*capture, error) {
 		return nil, E.Cause(err, "open a packet socket")
 	}
 	c := &capture{fd: fd, local: local, remote: remote, done: make(chan struct{})}
-	c.counter.window = window
 	err = c.setup()
 	if err != nil {
 		unix.Close(fd)
@@ -261,11 +304,11 @@ func (c *capture) take(packet []byte, index int, at time.Time) {
 	c.counter.add(at, binary.BigEndian.Uint32(tcp[4:8]), payload)
 }
 
-// stop ends the capture once the packets already taken are read, and returns the counts and
-// how many packets the socket dropped.
-func (c *capture) stop() (Counts, int) {
+// stop ends the capture once the packets already taken are read, and returns what it
+// counted and how many packets the socket dropped.
+func (c *capture) stop() (*counter, int) {
 	if c.stopped.Swap(true) {
-		return Counts{}, 0
+		return &counter{}, 0
 	}
 	<-c.done
 	dropped := 0
@@ -275,5 +318,5 @@ func (c *capture) stop() (Counts, int) {
 	unix.Close(c.fd)
 	c.access.Lock()
 	defer c.access.Unlock()
-	return c.counter.finish(), dropped
+	return &c.counter, dropped
 }

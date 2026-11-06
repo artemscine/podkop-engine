@@ -22,12 +22,27 @@ type contextKey struct{}
 type Socket struct {
 	window int
 
-	access  sync.Mutex
-	taken   bool
-	conn    *net.TCPConn
-	connect time.Duration
-	capture *capture
-	err     error
+	access   sync.Mutex
+	taken    bool
+	conn     *net.TCPConn
+	connect  time.Duration
+	capture  *capture
+	err      error
+	restored bool
+}
+
+// restore gives the probe connection a receive buffer as large as the system lets a TCP
+// connection grow to, once the probe has run: a multiplexed transport (gRPC, HTTP/2, xhttp,
+// mux) keeps the connection a probe dialed in its pool and carries other connections over
+// it, which a window of 16 KB would hold to a crawl. The window scale was chosen at the
+// connect by the system maximum, not by the small buffer, so the window can grow again.
+// Called under access.
+func (s *Socket) restore() {
+	if s.conn == nil || s.restored {
+		return
+	}
+	s.restored = true
+	restoreBuffer(s.conn)
 }
 
 // With returns a context under which the first TCP dial is a probe connection with a
@@ -94,7 +109,7 @@ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, ad
 		return conn, nil
 	}
 	s.conn = tcpConn
-	s.capture, s.err = startCapture(tcpConn, reorderWindow(connect))
+	s.capture, s.err = startCapture(tcpConn)
 	return conn, nil
 }
 
@@ -123,12 +138,9 @@ func (s *Socket) Finish() (Result, error) {
 		return result, E.New("no connection of its own")
 	}
 	if s.capture == nil {
+		s.restore()
 		return result, E.Cause(s.err, "capture")
 	}
-	counts, dropped := s.capture.stop()
-	s.capture = nil
-	result.Counts = counts
-	result.Dropped = dropped
 	result.RTT = s.connect
 	if info, err := tcpInfo(s.conn); err == nil {
 		result.MSS = info.mss
@@ -136,7 +148,12 @@ func (s *Socket) Finish() (Result, error) {
 			result.RTT = info.minRTT
 		}
 	}
-	result.Segments, result.Lost = counts.segments(result.MSS)
+	counter, dropped := s.capture.stop()
+	s.capture = nil
+	s.restore()
+	result.Counts = counter.finish(reorderWindow(result.RTT))
+	result.Dropped = dropped
+	result.Segments, result.Lost = result.Counts.segments(result.MSS)
 	return result, nil
 }
 
@@ -151,4 +168,5 @@ func (s *Socket) Close() {
 		s.capture.stop()
 		s.capture = nil
 	}
+	s.restore()
 }

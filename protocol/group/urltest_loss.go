@@ -268,8 +268,9 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
 	switch {
 	case err == nil:
 		g.history.StoreLossSample(tag, sample)
-		g.logger.Debug("outbound ", tag, " loss probe: ", sample.Lost, " of ", sample.Segments, " segments lost, RTT ",
-			sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ", sample.Elapsed.Milliseconds(), "ms")
+		g.logger.Debug("outbound ", tag, " loss probe: ", sample.Lost, " of ", sample.Segments, " segments lost, ",
+			sample.Reordered, " bytes reordered, RTT ", sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ",
+			sample.Elapsed.Milliseconds(), "ms")
 		return true, nil
 	case errors.Is(err, urltest.ErrLossNotCounted):
 		g.history.StoreLossNotCounted(tag, time.Now())
