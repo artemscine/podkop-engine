@@ -147,7 +147,7 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		group.links = s.links
 		group.mode, group.loss = s.mode, s.loss
 		if s.mode == modeBalance {
-			group.balance = newBalancer()
+			group.balance.Store(newBalancer())
 		}
 		s.group = group
 	case adapter.StartStateStarted:
@@ -206,6 +206,13 @@ func (s *URLTest) References() []string {
 	}
 	if selectedUDP != nil && selectedUDP != selectedTCP {
 		references = append(references, selectedUDP.Tag())
+	}
+	// the members of a balance carry connections too (podkop-engine): their idle connections
+	// are kept as the choice's are
+	for _, tag := range group.balanceReferences() {
+		if !slices.Contains(references, tag) {
+			references = append(references, tag)
+		}
 	}
 	return references
 }
@@ -395,10 +402,12 @@ type URLTestGroup struct {
 	uses      map[adapter.Outbound]int
 	// the mode and its options (urltest_loss.go, urltest_balance.go); the loss probes of a
 	// round run while lossRunning
-	mode        string
-	loss        lossOptions
-	balance     *balancer
-	lossRunning atomic.Bool
+	mode         string
+	loss         lossOptions
+	balance      atomic.Pointer[balancer]
+	lossRunning  atomic.Bool
+	switchProbes sync.Map // member tag → a probe before a switch to it runs
+	switchProbed sync.Map // member tag → when the last probe before a switch to it began
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, fallbacks []adapter.Outbound, link string, downloadLink string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -881,7 +890,7 @@ func (g *URLTestGroup) updateSelection() {
 	}
 	if g.selectionMayWait() {
 		// new dials already pass over a member without a test result while the selection
-		// waits (selectionPending), which the download test or a loss probe may make long
+		// waits (selectionPending), which the download test may make long
 		g.closeUnanswered()
 	}
 	var (

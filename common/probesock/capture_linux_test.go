@@ -126,3 +126,20 @@ func TestFinishWithoutDial(t *testing.T) {
 	require.Error(t, err)
 	socket.Close()
 }
+
+// A dial under the context of a probe that is over is an ordinary connection: no capture is
+// started that nobody would stop.
+func TestSealedAfterClose(t *testing.T) {
+	address := serve(t, 64<<10)
+	ctx, socket := With(context.Background(), Window)
+	socket.Close()
+	conn, err := socket.Dial(ctx, net.Dialer{}, "tcp", address)
+	require.NoError(t, err)
+	defer conn.Close()
+	socket.access.Lock()
+	require.Nil(t, socket.capture)
+	require.Nil(t, socket.conn)
+	socket.access.Unlock()
+	_, err = socket.Finish()
+	require.ErrorIs(t, err, ErrNoOwnConnection)
+}

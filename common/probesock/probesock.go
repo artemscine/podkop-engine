@@ -29,7 +29,16 @@ type Socket struct {
 	capture  *capture
 	err      error
 	restored bool
+	// sealed: the probe is over (Finish or Close). A transport may still dial under its context
+	// afterwards (in the background, with the cancellation taken off): that is an ordinary
+	// connection, with no capture nobody would stop
+	sealed bool
 }
+
+// ErrNoOwnConnection tells that the probe went over no TCP connection of its own: a
+// multiplexed transport took a connection it had, or the transport is not TCP. Probing the
+// member again would not count either.
+var ErrNoOwnConnection = E.New("no connection of its own")
 
 // restore lets the window of the probe connection grow again once the probe has run: a
 // multiplexed transport (gRPC, HTTP/2, xhttp, mux) keeps the connection a probe dialed in its
@@ -72,7 +81,7 @@ func (s *Socket) take() bool {
 	}
 	s.access.Lock()
 	defer s.access.Unlock()
-	if s.taken {
+	if s.taken || s.sealed {
 		return false
 	}
 	s.taken = true
@@ -100,10 +109,14 @@ func (s *Socket) Dial(ctx context.Context, dialer net.Dialer, network string, ad
 	connect := time.Since(start)
 	s.access.Lock()
 	defer s.access.Unlock()
+	if s.sealed {
+		// the probe ended while this dialed: an ordinary connection
+		return conn, nil
+	}
 	s.connect = connect
 	tcpConn, isTCP := conn.(*net.TCPConn)
 	if !isTCP {
-		s.err = E.New("not a TCP connection")
+		s.err = E.Cause(ErrNoOwnConnection, "not a TCP connection")
 		return conn, nil
 	}
 	s.conn = tcpConn
@@ -132,12 +145,13 @@ type Result struct {
 func (s *Socket) Finish() (Result, error) {
 	s.access.Lock()
 	defer s.access.Unlock()
+	s.sealed = true
 	var result Result
 	if !s.taken || s.conn == nil {
 		if s.err != nil {
 			return result, s.err
 		}
-		return result, E.New("no connection of its own")
+		return result, ErrNoOwnConnection
 	}
 	if s.capture == nil {
 		s.restore()
@@ -166,6 +180,7 @@ func (s *Socket) Close() {
 	}
 	s.access.Lock()
 	defer s.access.Unlock()
+	s.sealed = true
 	if s.capture != nil {
 		s.capture.stop()
 		s.capture = nil

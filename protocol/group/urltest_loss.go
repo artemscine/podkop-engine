@@ -47,12 +47,10 @@ const (
 	// probe, or a few hours of small ones.
 	lossMinSegments = 700
 	// lossCommonMembers is how many members with a count it takes to tell the loss of the
-	// line from the loss of a server.
-	lossCommonMembers = 3
+	// line from the loss of a server: a rule of two servers is common
+	lossCommonMembers = 2
 	// lossNotCountedRest is how long a member whose probe could not count is not probed.
 	lossNotCountedRest = 6 * time.Hour
-	// lossSwitchProbes bounds the large probes of one selection.
-	lossSwitchProbes = 2
 )
 
 // lossProbeSlot lets one loss probe run at a time in the process: two at once would share
@@ -96,11 +94,13 @@ func groupMode(mode string, link string, interval time.Duration, threshold float
 	}
 	if options.balanceSize == 0 {
 		options.balanceSize = defaultBalanceSize
-	} else if options.balanceSize < 0 {
-		return "", options, E.New("balance_size must be positive")
+	} else if options.balanceSize < 0 || options.balanceSize > maxBalanceSize {
+		return "", options, E.New("balance_size must be from 1 to ", maxBalanceSize)
 	}
 	if options.balanceIdle == 0 {
 		options.balanceIdle = defaultBalanceIdle
+	} else if options.balanceIdle < 0 {
+		return "", options, E.New("balance_idle must be positive")
 	}
 	return mode, options, nil
 }
@@ -219,69 +219,124 @@ func (g *URLTestGroup) rankedOutbounds(network string, view lossView) ([]adapter
 	return members, delays
 }
 
-// lossDue tells whether a member is to be probed now: its last count is older than the
-// interval, and its last probe did count (or long ago).
-func (g *URLTestGroup) lossDue(tag string) bool {
+// lossRest is how long after a probe of a member the next one waits: the interval, a little
+// early since the rounds that bring the probes come once a URL test interval, but never less
+// than half of it (a URL test interval longer than the loss interval would make a member due
+// at every round, and two groups probe it back to back).
+func (g *URLTestGroup) lossRest() time.Duration {
+	return max(g.loss.interval-g.interval/2, g.loss.interval/2)
+}
+
+// lossResting tells whether a member is not to be probed now: its probe could not count for
+// want of a connection of its own lately, or one was made (counted or failed) within the rest.
+func (g *URLTestGroup) lossResting(tag string) bool {
 	if notCounted := g.history.LossNotCounted(tag); !notCounted.IsZero() && time.Since(notCounted) < lossNotCountedRest {
-		return false
+		return true
 	}
-	last, exists := g.history.LastLossSample(tag)
-	// a little early: the rounds that bring the probes come once a URL test interval
-	return !exists || time.Since(last.At) >= g.loss.interval-g.interval/2
+	last, _ := g.history.LossAttempt(tag)
+	return !last.IsZero() && time.Since(last) < g.lossRest()
+}
+
+// lossDue tells whether a member is to be probed now.
+func (g *URLTestGroup) lossDue(tag string) bool {
+	return !g.lossResting(tag)
 }
 
 // needsSwitchProbe tells whether a member the group would switch to is probed first: it can
-// be counted, and has no count to decide by that is fresher than the interval.
+// be counted, no probe before a switch to it ran within the rest (one that counted too little
+// to decide by, a slow path cut by the time limit, would be made again at every selection),
+// no probe of it failed within the rest (a URL that answers a status through it would hold it
+// back for good), and it has no count to decide by fresher than the interval.
 func (g *URLTestGroup) needsSwitchProbe(tag string) bool {
 	if notCounted := g.history.LossNotCounted(tag); !notCounted.IsZero() && time.Since(notCounted) < lossNotCountedRest {
 		return false
 	}
-	last, exists := g.history.LastLossSample(tag)
-	if !exists || time.Since(last.At) >= g.loss.interval {
+	if started, probed := g.switchProbed.Load(tag); probed && time.Since(started.(time.Time)) < g.lossRest() {
+		return false
+	}
+	if last, failures := g.history.LossAttempt(tag); failures > 0 && time.Since(last) < g.lossRest() {
+		return false
+	}
+	sample, exists := g.history.LastLossSample(tag)
+	if !exists || time.Since(sample.At) >= g.loss.interval {
 		return true
 	}
 	_, known := g.history.LossOfWindow(tag, time.Now(), lossMinSegments)
 	return !known
 }
 
-// probeLoss runs a loss probe of size bytes through member and keeps what it counted. It
-// reports whether a count was kept, and the error of a probe that did not download.
-func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64, periodic bool) (bool, error) {
-	ctx, cancel := context.WithTimeout(g.ctx, urltest.LossProbeTimeout+urltest.LossProbeTimeout/2)
-	defer cancel()
+// lossSlotWait bounds how long a probe waits for the probes of other groups.
+const lossSlotWait = 30 * time.Second
+
+// probeLoss runs a loss probe of size bytes through member and keeps what it counted; it
+// reports whether a count was kept. A probe that kept none is recorded: the next one waits
+// the rest, and only the first failure in a row is a warning.
+func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64, periodic bool) bool {
+	wait, cancelWait := context.WithTimeout(g.ctx, lossSlotWait)
 	select {
 	case lossProbeSlot <- struct{}{}:
-	case <-ctx.Done():
-		return false, nil
+		cancelWait()
+	case <-wait.Done():
+		cancelWait()
+		return false
 	}
 	defer func() { <-lossProbeSlot }()
 	if periodic && !g.lossDue(tag) {
 		// another group probed it while this one waited
-		return false, nil
+		return false
 	}
+	// the probe's own time, after the wait: a megabyte at the window of the probe over a far
+	// path takes most of it
+	ctx, cancel := context.WithTimeout(g.ctx, urltest.LossProbeTimeout+5*time.Second)
+	defer cancel()
 	// a new connection to the first server of the member, like a URL test (probes)
 	if probes.waitHop(ctx, firstHop(g.outbound, member)) != nil {
-		return false, nil
+		return false
 	}
 	start := time.Now()
 	sample, err := urltest.LossProbe(ctx, g.loss.link, size, member)
+	if g.ctx.Err() != nil {
+		// the group was closed or replaced: after a swap the tag may be another outbound's
+		return false
+	}
 	switch {
 	case err == nil:
 		g.history.StoreLossSample(tag, sample)
 		g.logger.Debug("outbound ", tag, " loss probe: ", sample.Lost, " of ", sample.Segments, " segments lost, ",
 			sample.Reordered, " bytes reordered, RTT ", sample.RTT.Milliseconds(), "ms, ", sample.Received, " bytes in ",
 			sample.Elapsed.Milliseconds(), "ms")
-		return true, nil
-	case errors.Is(err, urltest.ErrLossNotCounted):
+		return true
+	case errors.Is(err, urltest.ErrLossNotOwnConnection):
 		g.history.StoreLossNotCounted(tag, time.Now())
 		g.logger.Info("outbound ", tag, " loss probe could not count, the member is chosen by its delay: ", err)
-		return false, nil
-	case g.ctx.Err() != nil || g.networkChangedSince(start):
-		return false, nil
+	case g.networkChangedSince(start):
+		// cut by a change of the network: says nothing, and is made again at the next round
 	default:
-		g.logger.Warn("outbound ", tag, " loss probe: ", err)
-		return false, err
+		if g.history.StoreLossFailure(tag, time.Now()) == 1 {
+			g.logger.Warn("outbound ", tag, " loss probe: ", err)
+		} else {
+			g.logger.Debug("outbound ", tag, " loss probe: ", err)
+		}
 	}
+	return false
+}
+
+// startSwitchProbe probes, in the background, a member the group would switch to, and asks
+// for a selection once the probe is done: the selection does not wait for it (a megabyte
+// may take half a minute, and a member in use that goes down meanwhile is left at once). One
+// probe of a member at a time.
+func (g *URLTestGroup) startSwitchProbe(tag string, member adapter.Outbound) {
+	if _, running := g.switchProbes.LoadOrStore(tag, struct{}{}); running {
+		return
+	}
+	g.switchProbed.Store(tag, time.Now())
+	go func() {
+		defer g.switchProbes.Delete(tag)
+		g.probeLoss(tag, member, urltest.LossProbeLarge, false)
+		if g.ctx.Err() == nil {
+			g.requestUpdateCheck()
+		}
+	}()
 }
 
 // lossTargets are the members the periodic probes keep counted: in the mode loss the one
@@ -327,7 +382,7 @@ func (g *URLTestGroup) lossRound() {
 			if !g.lossDue(tag) {
 				continue
 			}
-			if kept, _ := g.probeLoss(tag, member, urltest.LossProbeSmall, true); kept {
+			if g.probeLoss(tag, member, urltest.LossProbeSmall, true) {
 				counted = true
 			}
 		}

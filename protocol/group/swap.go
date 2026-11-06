@@ -60,9 +60,7 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 		g.frozen.Store(kept)
 	}
 	// a balance goes on with its devices: their connections end on the balancer they began on
-	if g.balance != nil && from.balance != nil {
-		g.balance = from.balance
-	}
+	g.takeBalance(from)
 	g.hotStart = true
 }
 

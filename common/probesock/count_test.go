@@ -119,3 +119,22 @@ func TestCounterWindowAtTheEnd(t *testing.T) {
 	require.Equal(t, int64(1000), c.finish(40*time.Millisecond).ReorderBytes)
 	require.Zero(t, c.finish(40*time.Millisecond).LostBytes)
 }
+
+// A packet in the middle of a hole splits it; the holes after it stay as they were.
+func TestCounterSplitKeepsLaterHoles(t *testing.T) {
+	c := newCounter()
+	c.add(at(0), 0, 1000)
+	c.add(at(1), 4000, 1000)
+	c.add(at(2), 6000, 1000)
+	// holes [1000,4000) and [5000,6000); a retransmission lands in the middle of the first
+	c.add(at(50), 2000, 1000)
+	c.add(at(60), 1000, 1000)
+	c.add(at(70), 3000, 1000)
+	c.add(at(80), 5000, 1000)
+	counts := c.finish(testWindow)
+	require.Equal(t, int64(4000), counts.LostBytes)
+	require.Equal(t, 4, counts.LostFills)
+	require.Zero(t, counts.DupBytes)
+	require.Zero(t, counts.Unfilled)
+	require.Equal(t, int64(7000), counts.Bytes)
+}

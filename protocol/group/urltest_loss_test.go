@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,7 +81,7 @@ func newModeGroup(t *testing.T, mode string, outbounds []adapter.Outbound, delay
 	require.NoError(t, err)
 	urlTest.mode, urlTest.loss = group.mode, group.loss
 	if mode == modeBalance {
-		group.balance = newBalancer()
+		group.balance.Store(newBalancer())
 	}
 	if prepare != nil {
 		prepare(group)
@@ -149,8 +151,19 @@ func lossURL(t *testing.T, requests *int) string {
 	return server.URL
 }
 
-// A member that became faster is probed before the switch; the switch follows a clean count,
-// or one that could not count (the member is then chosen by its delay).
+// waitChoice waits for the TCP choice of the group to be tag: a probe before a switch runs in
+// the background and asks for a selection when it is done.
+func waitChoice(t *testing.T, group *URLTestGroup, tag string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		tcp, _ := selectedTags(group)
+		return tcp == tag
+	}, 10*time.Second, 20*time.Millisecond)
+}
+
+// A member that became faster is probed before the switch, in the background while the member
+// in use stays; the switch follows a clean count, or one that could not count (the member is
+// then chosen by its delay).
 func TestLossModeProbesBeforeSwitch(t *testing.T) {
 	requests := 0
 	link := lossURL(t, &requests)
@@ -162,7 +175,8 @@ func TestLossModeProbesBeforeSwitch(t *testing.T) {
 	setResult(group, "b", 20)
 	group.performUpdateCheck()
 	tcp, _ = selectedTags(group)
-	require.Equal(t, "b", tcp)
+	require.Equal(t, "a", tcp, "the member in use stays while the probe runs")
+	waitChoice(t, group, "b")
 	require.Equal(t, 1, requests)
 	_, counted := group.history.LastLossSample("b")
 	notCounted := group.history.LossNotCounted("b")
@@ -238,7 +252,7 @@ func TestBalanceSpreadsAndKeeps(t *testing.T) {
 		source := fmt.Sprint("10.0.0.", i)
 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
 		require.NoError(t, err)
-		member := group.balance.devices[source].member.Tag()
+		member := group.balance.Load().devices[source].member.Tag()
 		given[source] = member
 		used[member]++
 		conn.Close()
@@ -248,7 +262,7 @@ func TestBalanceSpreadsAndKeeps(t *testing.T) {
 	for source, member := range given {
 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
 		require.NoError(t, err)
-		require.Equal(t, member, group.balance.devices[source].member.Tag())
+		require.Equal(t, member, group.balance.Load().devices[source].member.Tag())
 		conn.Close()
 	}
 }
@@ -264,7 +278,7 @@ func TestBalanceMoves(t *testing.T) {
 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
 		require.NoError(t, err)
 		conn.Close()
-		return group.balance.devices[source].member.Tag()
+		return group.balance.Load().devices[source].member.Tag()
 	}
 	// a device on each member
 	sources := make(map[string]string)
@@ -291,7 +305,7 @@ func TestBalanceMoves(t *testing.T) {
 	}
 	held, err := urlTest.DialContext(sourceContext(sources["a"]), N.NetworkTCP, target)
 	require.NoError(t, err)
-	require.Equal(t, "a", group.balance.devices[sources["a"]].member.Tag())
+	require.Equal(t, "a", group.balance.Load().devices[sources["a"]].member.Tag())
 	held.Close()
 	group.loss.balanceIdle = 20 * time.Millisecond
 	time.Sleep(50 * time.Millisecond)
@@ -299,11 +313,11 @@ func TestBalanceMoves(t *testing.T) {
 }
 
 // A loss URL that answers with a status proves nothing about a member: the switch goes by the
-// delay, as without the probe.
+// delay, and the member is not probed again before the rest.
 func TestLossModeBrokenURLDoesNotHold(t *testing.T) {
-	requests := 0
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+		requests.Add(1)
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	t.Cleanup(server.Close)
@@ -312,28 +326,30 @@ func TestLossModeBrokenURLDoesNotHold(t *testing.T) {
 	group.loss.link = server.URL
 	setResult(group, "b", 20)
 	group.performUpdateCheck()
-	tcp, _ := selectedTags(group)
-	require.Equal(t, "b", tcp)
-	require.Equal(t, 1, requests)
+	waitChoice(t, group, "b")
+	require.Equal(t, int32(1), requests.Load())
+	_, failures := group.history.LossAttempt("b")
+	require.Equal(t, 1, failures)
+	require.False(t, group.lossDue("b"))
+	require.False(t, group.needsSwitchProbe("b"))
 }
 
-// A body that stops on the way holds the member back for this selection.
-func TestLossModeStoppedDownloadHolds(t *testing.T) {
+// Probes that keep no count are made once an interval, not at every round.
+func TestLossFailuresRest(t *testing.T) {
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", fmt.Sprint(urltest.LossProbeLarge))
-		w.Write(make([]byte, 64<<10))
-		w.(http.Flusher).Flush()
-		conn, _, _ := w.(http.Hijacker).Hijack()
-		conn.Close()
+		requests.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	t.Cleanup(server.Close)
 	a, b := newTestMember(C.TypeSOCKS, "a", dialProbe), newTestMember(C.TypeSOCKS, "b", dialProbe)
 	_, group := newModeGroup(t, modeLoss, members(a, b), map[string]uint16{"a": 100, "b": 300}, nil)
 	group.loss.link = server.URL
-	setResult(group, "b", 20)
-	group.performUpdateCheck()
-	tcp, _ := selectedTags(group)
-	require.Equal(t, "a", tcp)
+	for round := 0; round < 3; round++ {
+		group.lossRound()
+		require.Eventually(t, func() bool { return !group.lossRunning.Load() }, 10*time.Second, 10*time.Millisecond)
+	}
+	require.Equal(t, int32(2), requests.Load(), "a and b once each, in three rounds")
 }
 
 // A device that moved off a member that went down comes back to it once the member is up and
@@ -347,15 +363,9 @@ func TestBalanceReturnsAfterIdle(t *testing.T) {
 		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
 		require.NoError(t, err)
 		conn.Close()
-		return group.balance.devices[source].member.Tag()
+		return group.balance.Load().devices[source].member.Tag()
 	}
-	var onB string
-	for i := 1; i < 200 && onB == ""; i++ {
-		if source := fmt.Sprint("10.2.0.", i); memberOf(source) == "b" {
-			onB = source
-		}
-	}
-	require.NotEmpty(t, onB)
+	onB := deviceOn(t, memberOf, "10.2.0.", "b")
 	setResult(group, "b", 0)
 	group.performUpdateCheck()
 	require.Equal(t, "a", memberOf(onB))
@@ -370,4 +380,107 @@ func TestBalanceReturnsAfterIdle(t *testing.T) {
 	held.Close()
 	time.Sleep(50 * time.Millisecond)
 	require.Equal(t, "b", memberOf(onB))
+}
+
+// deviceOn finds a source address of prefix the balance gives to member.
+func deviceOn(t *testing.T, memberOf func(source string) string, prefix string, member string) string {
+	t.Helper()
+	for i := 1; i < 250; i++ {
+		if source := fmt.Sprint(prefix, i); memberOf(source) == member {
+			return source
+		}
+	}
+	t.Fatal("no device on ", member)
+	return ""
+}
+
+// A member that went down since the last selection takes no device: the dial passes it over
+// before the next selection does.
+func TestBalanceDeadMemberAtDial(t *testing.T) {
+	a, b := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
+	urlTest, group := newModeGroup(t, modeBalance, members(a, b), map[string]uint16{"a": 100, "b": 110}, nil)
+	target := balanceTarget(t)
+	memberOf := func(source string) string {
+		conn, err := urlTest.DialContext(sourceContext(source), N.NetworkTCP, target)
+		require.NoError(t, err)
+		conn.Close()
+		return group.balance.Load().devices[source].member.Tag()
+	}
+	onB := deviceOn(t, memberOf, "10.3.0.", "b")
+	setResult(group, "b", 0)
+	require.Equal(t, "a", memberOf(onB))
+	for i := 1; i < 40; i++ {
+		require.Equal(t, "a", memberOf(fmt.Sprint("10.4.0.", i)), "a new device")
+	}
+}
+
+// A hot swap hands the devices to the new group, with the members of the new group only; the
+// old group balances no more.
+func TestBalanceTakeOver(t *testing.T) {
+	a, b, c := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking), newTestMember(C.TypeSOCKS, "c", dialWorking)
+	oldTest, oldGroup := newModeGroup(t, modeBalance, members(a, b, c), map[string]uint16{"a": 100, "b": 110, "c": 120}, nil)
+	target := balanceTarget(t)
+	memberOf := func(test *URLTest, group *URLTestGroup, source string) string {
+		conn, err := test.DialContext(sourceContext(source), N.NetworkTCP, target)
+		require.NoError(t, err)
+		conn.Close()
+		return group.balance.Load().devices[source].member.Tag()
+	}
+	onC := deviceOn(t, func(source string) string { return memberOf(oldTest, oldGroup, source) }, "10.5.0.", "c")
+	newTest, newGroup := newModeGroup(t, modeBalance, members(a, b), nil, nil)
+	// the history of the URL tests is the process's, shared by the groups
+	newGroup.history = oldGroup.history
+	newTest.TakeOver(oldTest)
+	require.Nil(t, oldGroup.balance.Load())
+	balance := newGroup.balance.Load()
+	require.NotNil(t, balance)
+	require.Contains(t, balance.devices, onC, "the devices go on")
+	for _, member := range append(slices.Clone(balance.tcp), balance.udp...) {
+		require.NotEqual(t, "c", member.Tag())
+	}
+	newGroup.performUpdateCheck()
+	require.NotEqual(t, "c", memberOf(newTest, newGroup, onC))
+}
+
+// The members of a balance are referenced, not only the choice of the group: their idle
+// connections are kept.
+func TestBalanceReferences(t *testing.T) {
+	a, b, c := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking), newTestMember(C.TypeSOCKS, "c", dialWorking)
+	urlTest, _ := newModeGroup(t, modeBalance, members(a, b, c), map[string]uint16{"a": 100, "b": 110, "c": 120}, nil)
+	require.ElementsMatch(t, []string{"a", "b", "c"}, urlTest.References())
+}
+
+// A member that comes into the balance passes the download test first: one whose download
+// stops on the way stays out.
+func TestBalanceDownloadTestOnEntry(t *testing.T) {
+	full := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(urltest.DownloadTestSize))
+		w.Write(make([]byte, urltest.DownloadTestSize))
+	}))
+	t.Cleanup(full.Close)
+	frozen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(urltest.DownloadTestSize))
+		w.Write(make([]byte, 16<<10))
+		w.(http.Flusher).Flush()
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	}))
+	t.Cleanup(frozen.Close)
+	toFrozen := func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, frozen.Listener.Addr().String())
+	}
+	a, b, c := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", toFrozen), newTestMember(C.TypeSOCKS, "c", dialWorking)
+	urlTest, group := newModeGroup(t, modeBalance, members(a, b, c), nil, func(group *URLTestGroup) {
+		group.downloadLink = full.URL
+	})
+	for tag, delay := range map[string]uint16{"a": 100, "b": 110, "c": 120} {
+		setResult(group, tag, delay)
+	}
+	group.performUpdateCheck()
+	var tags []string
+	for _, member := range urlTest.Balance() {
+		tags = append(tags, member.Tag)
+	}
+	require.NotContains(t, tags, "b")
+	require.Contains(t, tags, "a")
 }

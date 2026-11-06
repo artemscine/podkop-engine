@@ -166,7 +166,7 @@ func htons(value uint16) uint16 {
 }
 
 func (c *capture) setup() error {
-	filter, err := portFilter(c.local.Port(), c.remote.Port())
+	filter, err := incomingFilter(c.local, c.remote)
 	if err != nil {
 		return err
 	}
@@ -174,8 +174,11 @@ func (c *capture) setup() error {
 	if err != nil {
 		return E.Cause(err, "attach the filter")
 	}
+	// what the router sends is not wanted: the kernel does not clone it for this socket
+	// (Linux 4.20 and later; on older ones it is passed over as it is read)
+	_ = unix.SetsockoptInt(c.fd, unix.SOL_PACKET, unix.PACKET_IGNORE_OUTGOING, 1)
 	// a probe is a few hundred packets a second: a megabyte of buffer holds seconds of them
-	_ = unix.SetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<20)
+	_ = setBuffer(c.fd, 1<<20)
 	err = unix.SetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPNS, 1)
 	if err != nil {
 		return E.Cause(err, "timestamps")
@@ -191,32 +194,57 @@ func (c *capture) setup() error {
 	return nil
 }
 
-// portFilter passes the TCP packets between the two ports either way, IPv4 not fragmented
-// or IPv6 without extension headers, cut to snapLength. The addresses are checked as the
-// packets are read: the ports are rarely shared, and the program stays short.
-func portFilter(localPort uint16, remotePort uint16) ([]unix.SockFilter, error) {
-	incoming := uint32(remotePort)<<16 | uint32(localPort)
-	outgoing := uint32(localPort)<<16 | uint32(remotePort)
-	program := []bpf.Instruction{
-		/* 0 */ bpf.LoadAbsolute{Off: 0, Size: 1},
-		/* 1 */ bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0xf0},
-		/* 2 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x40, SkipFalse: 8}, // IPv6: 11
-		/* 3 */ bpf.LoadAbsolute{Off: 9, Size: 1},
-		/* 4 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.IPPROTO_TCP, SkipFalse: 13},
-		/* 5 */ bpf.LoadAbsolute{Off: 6, Size: 2},
-		/* 6 */ bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x1fff, SkipTrue: 11}, // a fragment
-		/* 7 */ bpf.LoadMemShift{Off: 0},
-		/* 8 */ bpf.LoadIndirect{Off: 0, Size: 4},
-		/* 9 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: incoming, SkipTrue: 7},
-		/* 10 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: outgoing, SkipTrue: 6, SkipFalse: 7},
-		/* 11 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x60, SkipFalse: 6},
-		/* 12 */ bpf.LoadAbsolute{Off: 6, Size: 1},
-		/* 13 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.IPPROTO_TCP, SkipFalse: 4},
-		/* 14 */ bpf.LoadAbsolute{Off: 40, Size: 4},
-		/* 15 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: incoming, SkipTrue: 1},
-		/* 16 */ bpf.JumpIf{Cond: bpf.JumpEqual, Val: outgoing, SkipFalse: 1},
-		/* 17 */ bpf.RetConstant{Val: snapLength},
-		/* 18 */ bpf.RetConstant{Val: 0},
+// incomingFilter passes the TCP packets the remote end sends to the local port of the
+// connection, IPv4 not fragmented or IPv6 without extension headers, cut to snapLength.
+// The remote address is matched, the local one is not: a source NAT on the way out (mwan3,
+// a VPN that masquerades) rewrites it before the capture sees the packets come back. A
+// packet of another connection to the same server port that shares the local port (the
+// kernel lets connections to different destinations share one) stays out.
+func incomingFilter(local netip.AddrPort, remote netip.AddrPort) ([]unix.SockFilter, error) {
+	ports := uint32(remote.Port())<<16 | uint32(local.Port())
+	var program []bpf.Instruction
+	var drops []int // the jumps to the drop at the end, their skips set once it is placed
+	require := func(value uint32) {
+		drops = append(drops, len(program))
+		program = append(program, bpf.JumpIf{Cond: bpf.JumpEqual, Val: value})
+	}
+	program = append(program, bpf.LoadAbsolute{Off: 0, Size: 1}, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0xf0})
+	address := remote.Addr()
+	if address.Is4() {
+		require(0x40)
+		program = append(program, bpf.LoadAbsolute{Off: 9, Size: 1})
+		require(unix.IPPROTO_TCP)
+		// a fragment carries no TCP header where one is looked for
+		program = append(program, bpf.LoadAbsolute{Off: 6, Size: 2}, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0x1fff})
+		require(0)
+		bytes := address.As4()
+		program = append(program, bpf.LoadAbsolute{Off: 12, Size: 4})
+		require(binary.BigEndian.Uint32(bytes[:]))
+		program = append(program, bpf.LoadMemShift{Off: 0}, bpf.LoadIndirect{Off: 0, Size: 4})
+		require(ports)
+	} else {
+		require(0x60)
+		program = append(program, bpf.LoadAbsolute{Off: 6, Size: 1})
+		require(unix.IPPROTO_TCP)
+		bytes := address.As16()
+		for word := 0; word < 4; word++ {
+			program = append(program, bpf.LoadAbsolute{Off: uint32(8 + 4*word), Size: 4})
+			require(binary.BigEndian.Uint32(bytes[4*word:]))
+		}
+		program = append(program, bpf.LoadAbsolute{Off: 40, Size: 4})
+		require(ports)
+	}
+	program = append(program, bpf.RetConstant{Val: snapLength})
+	drop := len(program)
+	program = append(program, bpf.RetConstant{Val: 0})
+	for _, index := range drops {
+		jump := program[index].(bpf.JumpIf)
+		skip := drop - index - 1
+		if skip > 255 {
+			return nil, E.New("the filter is too long")
+		}
+		jump.SkipFalse = uint8(skip)
+		program[index] = jump
 	}
 	raw, err := bpf.Assemble(program)
 	if err != nil {
@@ -285,9 +313,9 @@ func (c *capture) take(packet []byte, index int, at time.Time) {
 		return
 	}
 	var (
-		source, destination netip.Addr
-		tcp                 []byte
-		payload             int
+		source  netip.Addr
+		tcp     []byte
+		payload int
 	)
 	switch packet[0] >> 4 {
 	case 4:
@@ -296,7 +324,6 @@ func (c *capture) take(packet []byte, index int, at time.Time) {
 			return
 		}
 		source = netip.AddrFrom4([4]byte(packet[12:16]))
-		destination = netip.AddrFrom4([4]byte(packet[16:20]))
 		tcp = packet[headerLength:]
 		payload = int(binary.BigEndian.Uint16(packet[2:4])) - headerLength - int(tcp[12]>>4)*4
 	case 6:
@@ -304,13 +331,13 @@ func (c *capture) take(packet []byte, index int, at time.Time) {
 			return
 		}
 		source = netip.AddrFrom16([16]byte(packet[8:24]))
-		destination = netip.AddrFrom16([16]byte(packet[24:40]))
 		tcp = packet[40:]
 		payload = int(binary.BigEndian.Uint16(packet[4:6])) - int(tcp[12]>>4)*4
 	default:
 		return
 	}
-	if source != c.remote.Addr() || destination != c.local.Addr() ||
+	// the local address is not matched: a source NAT on the way rewrites it (incomingFilter)
+	if source != c.remote.Addr() ||
 		binary.BigEndian.Uint16(tcp[0:2]) != c.remote.Port() || binary.BigEndian.Uint16(tcp[2:4]) != c.local.Port() {
 		return
 	}

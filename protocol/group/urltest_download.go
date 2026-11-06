@@ -72,9 +72,10 @@ func checkDownloadLink(name string, link string) error {
 
 // selectTested chooses the TCP member as Select does, except that a member the group would
 // switch to first passes the download test, and in the mode loss is first probed for loss
-// when it has no fresh count (podkop-engine). When no candidate passes, a current member
-// with a test result stays; without one, the plain choice is taken: a member frozen after
-// 16 KB carries small requests, a dead one none.
+// when it has no fresh count (podkop-engine): the probe runs in the background and the member
+// in use stays meanwhile; the probe asks for a selection when it is done. When no candidate
+// passes, a current member with a test result stays; without one, the plain choice is taken:
+// a member frozen after 16 KB carries small requests, a dead one none.
 func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 	if g.downloadLink == "" && g.mode != modeLoss {
 		return g.Select(N.NetworkTCP)
@@ -84,8 +85,6 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 	currentAlive := current != nil && !g.isFallback(current) && g.memberAlive(current)
 	tried := make(map[string]bool)
 	downloaded := make(map[string]bool)
-	probed := make(map[string]bool)
-	switchProbes := lossSwitchProbes
 	for {
 		candidate, exists := g.selectAmong(N.NetworkTCP, g.skipFrozen(tried))
 		if candidate == nil || !exists {
@@ -117,17 +116,11 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 			g.setFrozen(tag, time.Time{})
 			downloaded[tag] = true
 		}
-		if g.mode == modeLoss && currentAlive && candidate != current && !probed[tag] && switchProbes > 0 && g.needsSwitchProbe(tag) {
-			// the switch waits for a count of the candidate; with it the selection runs
-			// again, and the candidate may lose its place to the member in use or another
-			switchProbes--
-			probed[tag] = true
-			if _, err := g.probeLoss(tag, candidate, urltest.LossProbeLarge, false); errors.Is(err, urltest.ErrDownloadStopped) {
-				// its download stopped on the way: not now. A probe that could not run (the
-				// URL's status, no body) holds it back from nothing
-				tried[tag] = true
-			}
-			continue
+		if g.mode == modeLoss && currentAlive && candidate != current && g.needsSwitchProbe(tag) {
+			// the switch waits for a count of the candidate: the member in use stays until the
+			// probe is done, and the selection then runs again with what it counted
+			g.startSwitchProbe(tag, candidate)
+			break
 		}
 		return candidate, true
 	}
@@ -144,10 +137,10 @@ func (g *URLTestGroup) selectionPending(selected adapter.Outbound) bool {
 	return g.selectionMayWait() && g.history.LoadURLTestHistory(RealTag(selected, N.NetworkTCP)) == nil
 }
 
-// selectionMayWait tells whether a selection may wait for a test of a candidate: the
-// download test, or the loss probe before a switch.
+// selectionMayWait tells whether a selection may wait for a test of a candidate: the download
+// test (a loss probe runs in the background).
 func (g *URLTestGroup) selectionMayWait() bool {
-	return g.downloadLink != "" || g.mode == modeLoss
+	return g.downloadLink != ""
 }
 
 // selectUDP chooses the UDP member as Select does, passing over the members frozen for TCP.

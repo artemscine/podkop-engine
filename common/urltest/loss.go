@@ -37,8 +37,34 @@ const (
 
 // ErrLossNotCounted is the failure of a probe that downloaded but could not count: the
 // connection was not its own (a multiplexed transport, QUIC), or the capture could not
-// keep up. It says nothing about the server, and probing it again soon would not either.
+// keep up. It says nothing about the server.
 var ErrLossNotCounted = E.New("loss not counted")
+
+// ErrLossNotOwnConnection wraps ErrLossNotCounted when the probe had no TCP connection of its
+// own (a multiplexed transport, QUIC): probing the member again would not count either.
+var ErrLossNotOwnConnection = E.New("the probe had no connection of its own")
+
+// lossStall is how long a body may bring nothing before the probe calls it stopped: a slow
+// path that keeps bringing data is counted as far as it came, not failed. A variable for the
+// tests, as lossClientTimeout.
+var lossStall = 5 * time.Second
+
+// lossClientTimeout bounds the request of a probe.
+var lossClientTimeout = LossProbeTimeout
+
+// progressReader notes when the last bytes came.
+type progressReader struct {
+	io.Reader
+	last time.Time
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.last = time.Now()
+	}
+	return n, err
+}
 
 // LossSample is what one loss probe counted.
 type LossSample struct {
@@ -52,11 +78,13 @@ type LossSample struct {
 }
 
 // LossProbe downloads size bytes of link through detour over a probe connection and returns
-// what its packets showed. An error wrapping ErrLossNotCounted tells a download that went
-// but could not be counted; one wrapping ErrDownloadStopped, a body that began and stopped
-// on the way (the member's failure, as in the download test); another error, a probe that
-// could not run (the URL answered with a status, the dial failed), which proves nothing
-// about the member.
+// what its packets showed. A body cut by the time limit while it still came (a slow path: a
+// megabyte at the window of the probe takes some 50 round trips) is counted as far as it
+// came. An error wrapping ErrLossNotCounted tells a download that went but could not be
+// counted (ErrLossNotOwnConnection: and never will be); one wrapping ErrDownloadStopped, a body
+// that began and then brought nothing for lossStall (the member's failure, as in the
+// download test); another error, a probe that could not run (the URL answered with a status,
+// the dial failed), which proves nothing about the member.
 func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (LossSample, error) {
 	var sample LossSample
 	linkURL, err := url.Parse(link)
@@ -87,7 +115,7 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
 	}
 	req.Header.Set("Range", "bytes=0-"+strconv.FormatInt(size-1, 10))
 	client := probeClient(ctx, instance)
-	client.Timeout = LossProbeTimeout
+	client.Timeout = lossClientTimeout
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -97,7 +125,8 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return sample, E.New("HTTP ", resp.StatusCode)
 	}
-	received, err := io.CopyN(io.Discard, resp.Body, size)
+	body := &progressReader{Reader: resp.Body, last: time.Now()}
+	received, err := io.CopyN(io.Discard, body, size)
 	sample.Elapsed = time.Since(start)
 	sample.Received = received
 	if err != nil {
@@ -106,11 +135,17 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
 			return sample, E.Cause(err, "no body")
 		case errors.Is(err, io.EOF):
 			// the whole body, shorter than asked: counted as it is
+		case time.Since(body.last) < lossStall:
+			// cut by the time limit (or the end of the group) while it came: counted as far
+			// as it came
 		default:
 			return sample, E.Cause(errors.Join(ErrDownloadStopped, err), "after ", received, " bytes")
 		}
 	}
 	result, err := socket.Finish()
+	if errors.Is(err, probesock.ErrNoOwnConnection) {
+		return sample, E.Cause(errors.Join(ErrLossNotCounted, ErrLossNotOwnConnection), err)
+	}
 	if err != nil {
 		return sample, E.Cause(ErrLossNotCounted, err)
 	}
@@ -137,9 +172,12 @@ const lossKeepCount = 1440
 
 type lossState struct {
 	samples []LossSample
-	// when a probe of the tag downloaded and could not count: its connections are not its
-	// own, and probing it again soon would not count either
+	// when a probe of the tag downloaded and could not count because its connections are not
+	// its own: probing it again soon would not count either
 	notCounted time.Time
+	// when a probe of the tag was made last, and how many in a row failed (no count kept)
+	lastAttempt time.Time
+	failures    int
 }
 
 // StoreLossSample keeps a sample of a tag for LossKeep.
@@ -162,7 +200,37 @@ func (s *HistoryStorage) StoreLossSample(tag string, sample LossSample) {
 	}
 	state.samples = append(kept, sample)
 	state.notCounted = time.Time{}
+	state.lastAttempt = sample.At
+	state.failures = 0
 	s.notifyUpdated()
+}
+
+// StoreLossFailure records a probe of a tag that kept no count, and returns how many have
+// failed in a row: the next one waits an interval, as after a count.
+func (s *HistoryStorage) StoreLossFailure(tag string, at time.Time) int {
+	s.access.Lock()
+	defer s.access.Unlock()
+	state := s.losses[tag]
+	if state == nil {
+		state = &lossState{}
+		s.losses[tag] = state
+	}
+	state.lastAttempt = at
+	state.failures++
+	return state.failures
+}
+
+// LossAttempt returns when a probe of a tag was made last and how many in a row failed.
+func (s *HistoryStorage) LossAttempt(tag string) (time.Time, int) {
+	if s == nil {
+		return time.Time{}, 0
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	if state := s.losses[tag]; state != nil {
+		return state.lastAttempt, state.failures
+	}
+	return time.Time{}, 0
 }
 
 // StoreLossNotCounted records that a probe of a tag could not count.
@@ -175,6 +243,7 @@ func (s *HistoryStorage) StoreLossNotCounted(tag string, at time.Time) {
 		s.losses[tag] = state
 	}
 	state.notCounted = at
+	state.lastAttempt = at
 }
 
 // LossNotCounted returns when a probe of a tag last could not count, zero when the last

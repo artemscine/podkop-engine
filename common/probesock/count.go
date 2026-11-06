@@ -89,7 +89,9 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
 	}
 	limit := min(end, c.highest)
 	covered := int64(0)
-	kept := c.holes[:0]
+	// a new list: a packet inside a hole splits it in two, and a list filtered in place would
+	// write the second piece over the next hole before it is read
+	kept := make([]hole, 0, len(c.holes)+1)
 	for _, h := range c.holes {
 		from, to := max(start, h.start), min(limit, h.end)
 		if from >= to {
