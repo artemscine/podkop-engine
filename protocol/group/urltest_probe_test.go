@@ -235,7 +235,7 @@ func TestNeighbourLinksDownCostTheFirstRoundOnly(t *testing.T) {
 	var unavailable []int
 	for round := range 10 {
 		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
-		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1, nil)
 		if _, ok := result["a"]; !ok {
 			unavailable = append(unavailable, round)
 		}
@@ -245,7 +245,7 @@ func TestNeighbourLinksDownCostTheFirstRoundOnly(t *testing.T) {
 	dead := newTestMember(C.TypeVLESS, "dead", dialRefused)
 	for round := range 5 {
 		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
-		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{dead}, plan, time.Minute, true, true, 1)
+		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{dead}, plan, time.Minute, true, true, 1, nil)
 		require.NotContains(t, result, "dead")
 		require.Equal(t, int32(2*(round+1)), dead.dials.Load(), "two tests a round")
 	}
@@ -267,7 +267,7 @@ func TestMostLinksDownIsJudgedAsBefore(t *testing.T) {
 	var unavailable []int
 	for round := range 10 {
 		plan := roundPlan(links, time.Minute, time.Unix(0, 0).Add(time.Duration(round)*time.Minute))
-		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+		result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1, nil)
 		if _, ok := result["a"]; !ok {
 			unavailable = append(unavailable, round)
 		}
@@ -309,7 +309,7 @@ func TestRoundRetriesTheNextLink(t *testing.T) {
 	member := newTestMember(C.TypeVLESS, "a", dialWorking)
 	history := urltest.NewHistoryStorage()
 	plan := probePlan{links: []string{bad, good}, round: 7, keep: 2}
-	result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+	result := urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1, nil)
 	require.Contains(t, result, "a")
 	require.Equal(t, int32(1), goodRequests.Load())
 	require.NotNil(t, history.LoadURLTestHistory("a"))
@@ -318,7 +318,7 @@ func TestRoundRetriesTheNextLink(t *testing.T) {
 	require.False(t, failed)
 
 	plan = probePlan{links: []string{bad, bad + "?again"}, round: 8, keep: 2}
-	result = urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+	result = urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1, nil)
 	require.NotContains(t, result, "a")
 	require.Nil(t, history.LoadURLTestHistory("a"))
 	_, failed = history.LoadURLTestFailure("a")
@@ -333,7 +333,7 @@ func TestURLTestGroupMedianOfRounds(t *testing.T) {
 	history := urltest.NewHistoryStorage()
 	for round, link := range []string{slow, fast, fast} {
 		plan := probePlan{links: []string{link}, round: int64(round), keep: 3}
-		urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1)
+		urlTestOutbounds(context.Background(), nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{member}, plan, time.Minute, true, true, 1, nil)
 	}
 	delay := history.LoadURLTestHistory("a").Delay
 	require.Less(t, delay, uint16(100), "the slow URL of one round is not the delay")
