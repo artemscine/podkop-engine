@@ -20,17 +20,17 @@ func (s *HistoryStorage) CopyMemberFrom(from *HistoryStorage, tag string, checks
 		copy := *history
 		history = &copy
 	}
-	failure, failed := from.failures[tag]
-	download, downloaded := from.downloads[tag]
+	failure, failed := from.detail.failures[tag]
+	download, downloaded := from.detail.downloads[tag]
 	var samples []Sample
 	var links map[string]bool
-	keep := from.keeps[tag]
+	keep := from.detail.keeps[tag]
 	if checks {
-		samples = slices.Clone(from.samples[tag])
-		links = maps.Clone(from.links[tag])
+		samples = slices.Clone(from.detail.samples[tag])
+		links = maps.Clone(from.detail.links[tag])
 	}
 	var loss *lossState
-	if previous := from.losses[tag]; losses && previous != nil {
+	if previous := from.detail.losses[tag]; losses && previous != nil {
 		copy := *previous
 		copy.samples = slices.Clone(previous.samples)
 		loss = &copy
@@ -42,24 +42,24 @@ func (s *HistoryStorage) CopyMemberFrom(from *HistoryStorage, tag string, checks
 	if checks {
 		s.delayHistory[tag] = history
 		if failed {
-			s.failures[tag] = failure
+			s.detail.failures[tag] = failure
 		} else {
-			delete(s.failures, tag)
+			delete(s.detail.failures, tag)
 		}
-		s.samples[tag], s.keeps[tag], s.links[tag] = samples, keep, links
+		s.detail.samples[tag], s.detail.keeps[tag], s.detail.links[tag] = samples, keep, links
 	}
 	if downloads {
 		if downloaded {
-			s.downloads[tag] = download
+			s.detail.downloads[tag] = download
 		} else {
-			delete(s.downloads, tag)
+			delete(s.detail.downloads, tag)
 		}
 	}
 	if losses {
 		if loss != nil {
-			s.losses[tag] = loss
+			s.detail.losses[tag] = loss
 		} else {
-			delete(s.losses, tag)
+			delete(s.detail.losses, tag)
 		}
 	}
 	s.notifyUpdated()

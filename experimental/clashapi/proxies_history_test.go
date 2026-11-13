@@ -15,7 +15,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing-box/protocol/group/urltestgroup"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -56,10 +56,10 @@ func TestProxyInfoPublishesGroupScopedMemberHistory(t *testing.T) {
 	member := &historyTestMember{Adapter: outbound.NewAdapter(C.TypeVLESS, "shared", []string{N.NetworkTCP}, nil)}
 	manager := &historyTestManager{member: member}
 	ctx := service.ContextWith[adapter.OutboundManager](service.ContextWithPtr(context.Background(), history), manager)
-	makeGroup := func(tag, link string) *group.URLTest {
-		created, err := group.NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger(tag), tag, option.URLTestOutboundOptions{Outbounds: []string{"shared"}, URL: link})
+	makeGroup := func(tag, link string) *urltestgroup.URLTest {
+		created, err := urltestgroup.NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger(tag), tag, option.URLTestOutboundOptions{Outbounds: []string{"shared"}, URL: link})
 		require.NoError(t, err)
-		g := created.(*group.URLTest)
+		g := created.(*urltestgroup.URLTest)
 		require.NoError(t, g.Start(adapter.StartStateStart, nil))
 		t.Cleanup(g.Retire)
 		return g

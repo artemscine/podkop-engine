@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing-box/protocol/group/urltestgroup"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -70,7 +71,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	info.Put("type", clashType)
 	info.Put("name", detour.Tag())
 	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
-	delayHistory := group.MemberHistory(server.urlTestHistory, detour, N.NetworkTCP)
+	delayHistory := urltestgroup.MemberHistory(server.urlTestHistory, detour, N.NetworkTCP)
 	if delayHistory != nil {
 		info.Put("history", []*adapter.URLTestHistory{delayHistory})
 	} else {
@@ -79,7 +80,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	if loss := lossInfo(server.urlTestHistory, group.RealTag(detour, N.NetworkTCP)); loss != nil {
 		info.Put("loss", loss)
 	}
-	if urlTest, isURLTest := detour.(*group.URLTest); isURLTest {
+	if urlTest, isURLTest := detour.(*urltestgroup.URLTest); isURLTest {
 		if mode := urlTest.Mode(); mode != "fastest" {
 			info.Put("mode", mode)
 		}
@@ -99,7 +100,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("fallbacks", withFallbacks.Fallbacks())
 		}
 	}
-	if urlTestGroup, ok := detour.(*group.URLTest); ok {
+	if urlTestGroup, ok := detour.(*urltestgroup.URLTest); ok {
 		info.Put("member_history", urlTestGroup.MemberHistories())
 	}
 	return &info
