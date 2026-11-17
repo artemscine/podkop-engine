@@ -36,6 +36,7 @@ var defaultPacketSniffers = []sniff.PacketSniffer{
 	sniff.DomainNameQuery,
 	sniff.QUICClientHello,
 	sniff.STUNMessage,
+	sniff.DHT,
 	sniff.UTP,
 	sniff.UDPTracker,
 	sniff.DTLSRecord,
@@ -386,12 +387,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 		if !currentRule.Match(&metadata) {
 			continue
 		}
-		ruleDescription := currentRule.String()
-		if ruleDescription != "" {
-			r.logger.DebugContext(ctx, "pre-match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())
-		} else {
-			r.logger.DebugContext(ctx, "pre-match[", currentRuleIndex, "] => ", currentRule.Action())
-		}
+		r.logger.DebugContext(ctx, R.MatchLine{Prefix: "pre-match", Index: currentRuleIndex, Rule: currentRule})
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
 			if metadata.Network == N.NetworkICMP {
@@ -740,12 +736,7 @@ match:
 		if !currentRule.Match(metadata) {
 			continue
 		}
-		ruleDescription := currentRule.String()
-		if ruleDescription != "" {
-			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())
-		} else {
-			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] => ", currentRule.Action())
-		}
+		r.logger.DebugContext(ctx, R.MatchLine{Prefix: "match", Index: currentRuleIndex, Rule: currentRule})
 		var routeOptions *R.RuleActionRouteOptions
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionRoute:

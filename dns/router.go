@@ -308,11 +308,7 @@ func (r *Router) matchDNS(ctx context.Context, rules []adapter.DNSRule, allowFak
 		metadata.ResetRuleCache()
 		metadata.DestinationAddressMatchFromResponse = false
 		if currentRule.LegacyPreMatch(metadata) {
-			if ruleDescription := currentRule.String(); ruleDescription != "" {
-				r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())
-			} else {
-				r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] => ", currentRule.Action())
-			}
+			r.logger.DebugContext(ctx, R.MatchLine{Prefix: "match", Index: currentRuleIndex, Rule: currentRule})
 			switch action := currentRule.Action().(type) {
 			case *R.RuleActionDNSRoute:
 				transport, loaded := r.transport.Transport(action.Server)
@@ -428,11 +424,7 @@ func (r *Router) resolveDNSRoute(server string, routeOptions R.RuleActionDNSRout
 }
 
 func (r *Router) logRuleMatch(ctx context.Context, ruleIndex int, currentRule adapter.DNSRule) {
-	if ruleDescription := currentRule.String(); ruleDescription != "" {
-		r.logger.DebugContext(ctx, "match[", ruleIndex, "] ", currentRule, " => ", currentRule.Action())
-	} else {
-		r.logger.DebugContext(ctx, "match[", ruleIndex, "] => ", currentRule.Action())
-	}
+	r.logger.DebugContext(ctx, R.MatchLine{Prefix: "match", Index: ruleIndex, Rule: currentRule})
 }
 
 type exchangeWithRulesResult struct {
@@ -1092,7 +1084,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 		}, nil
 	}
 	if isResolverDiscoveryQuery(message.Question[0]) {
-		r.logger.DebugContext(ctx, "rejected resolver discovery query ", FormatQuestion(message.Question[0].String()))
+		r.logger.DebugContext(ctx, "rejected resolver discovery query ", QuestionLine{message.Question[0]})
 		return nil, &mDNS.Msg{
 			MsgHdr: mDNS.MsgHdr{
 				Id:                 message.Id,
@@ -1112,7 +1104,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	rules := r.rules
 	legacyDNSMode := r.legacyDNSMode
 	r.rulesAccess.RUnlock()
-	r.logger.DebugContext(ctx, "exchange ", FormatQuestion(message.Question[0].String()))
+	r.logger.DebugContext(ctx, "exchange ", QuestionLine{message.Question[0]})
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Destination = M.Socksaddr{}
 	metadata.QueryType = message.Question[0].Qtype
