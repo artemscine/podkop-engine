@@ -4,6 +4,7 @@ import (
 	std_bufio "bufio"
 	"context"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -99,7 +100,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := h.newConnection(ctx, conn, metadata, onClose)
+	err := maskAuthenticationError(h.newConnection(ctx, conn, metadata, onClose))
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
 		if E.IsClosedOrCanceled(err) {
@@ -108,6 +109,25 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 		}
 	}
+}
+
+// The handshake errors from sing contain everything the client sent, including passwords.
+func maskAuthenticationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, prefix := range []string{
+		"socks4: authentication failed, username=",
+		"socks5: authentication failed, username=",
+		"http: authentication failed, username=",
+		"http: authentication failed, Proxy-Authorization=",
+	} {
+		if strings.HasPrefix(message, prefix) {
+			return E.New(prefix + "MASKED")
+		}
+	}
+	return err
 }
 
 func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
@@ -141,7 +161,7 @@ func (h *Inbound) newUserConnection(ctx context.Context, conn net.Conn, metadata
 		return
 	}
 	metadata.User = user
-	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+	h.logger.InfoContext(ctx, "[MASKED] inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -161,9 +181,9 @@ func (h *Inbound) streamUserPacketConnection(ctx context.Context, conn N.PacketC
 	}
 	metadata.User = user
 	if !metadata.Destination.IsValid() {
-		h.logger.InfoContext(ctx, "[", user, "] inbound packet connection")
+		h.logger.InfoContext(ctx, "[MASKED] inbound packet connection")
 	} else {
-		h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
+		h.logger.InfoContext(ctx, "[MASKED] inbound packet connection to ", metadata.Destination)
 	}
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
