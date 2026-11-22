@@ -370,3 +370,21 @@ func TestClientTestKeepsTheMedian(t *testing.T) {
 	require.GreaterOrEqual(t, single.LoadURLTestHistory("a").Delay, uint16(150))
 	_ = link
 }
+
+// A first server whose time has passed is forgotten within spacing, however few there are: the
+// prober is the process's, and must not keep the outbounds of a configuration that was replaced.
+func TestProberForgetsHops(t *testing.T) {
+	p := newProber(2 * time.Second)
+	start := time.Unix(1000, 0)
+	for hop := 0; hop < 100; hop++ {
+		require.Zero(t, p.reserve(hop, start))
+	}
+	require.Len(t, p.hops, 100)
+	// a hop whose time has not passed is kept: the next test through it waits
+	require.Equal(t, time.Second, p.reserve(5, start.Add(time.Second)))
+	require.Zero(t, p.reserve("new", start.Add(time.Second)))
+	require.Len(t, p.hops, 101)
+	require.Zero(t, p.reserve("other", start.Add(3*time.Second)))
+	require.Len(t, p.hops, 1)
+	require.Contains(t, p.hops, any("other"))
+}

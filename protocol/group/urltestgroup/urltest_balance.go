@@ -41,6 +41,13 @@ const (
 	defaultBalanceIdle = 5 * time.Minute
 	// balanceForget is how long a device that opens no connection is remembered.
 	balanceForget = time.Hour
+	// balanceDevices is the most devices a balance remembers: a device is a source address, and
+	// what sends from addresses without end (the temporary addresses of IPv6, forged sources)
+	// must not grow the list for balanceForget. 4096 is a LAN of a thousand devices with four
+	// addresses each. Past it, the devices idle for balance_idle go (they are hashed again at
+	// their next connection anyway), and a device there is no room for goes by the member its
+	// address falls on, at every connection: the same member while the members stay.
+	balanceDevices = 4096
 )
 
 type balancer struct {
@@ -49,6 +56,11 @@ type balancer struct {
 	udp       []adapter.Outbound
 	devices   map[string]*balanceDevice
 	lastSweep time.Time
+	// lastFull: when the devices idle for balance_idle were last dropped for room (balanceDevices)
+	lastFull time.Time
+	// takenFrom: the group this balancer was taken from in a hot swap (takeBalance), to give it
+	// back to when the swap is undone
+	takenFrom *URLTestGroup
 }
 
 type balanceDevice struct {
@@ -166,8 +178,28 @@ func (g *URLTestGroup) takeBalance(from *URLTestGroup) {
 	}
 	b.access.Lock()
 	b.tcp, b.udp = keep(b.tcp), keep(b.udp)
+	b.takenFrom = from
 	b.access.Unlock()
 	g.balance.Store(b)
+}
+
+// returnBalance undoes takeBalance when the swap is undone (GiveBack): the group of before, which
+// runs on, has its balancer and its devices again, with the members the two groups share until
+// its next selection chooses them anew; this group, about to be closed, is left an empty one.
+func (g *URLTestGroup) returnBalance(to *URLTestGroup) {
+	b := g.balance.Load()
+	if b == nil {
+		return
+	}
+	b.access.Lock()
+	taken := b.takenFrom == to
+	if taken {
+		b.takenFrom = nil
+	}
+	b.access.Unlock()
+	if taken && g.balance.CompareAndSwap(b, newBalancer()) {
+		to.balance.CompareAndSwap(nil, b)
+	}
 }
 
 // balanceKey is the device a connection comes from: its source address, the same for its TCP
@@ -234,7 +266,17 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
 	device := b.devices[key]
 	if device == nil {
 		device = &balanceDevice{}
-		b.devices[key] = device
+		if len(b.devices) >= balanceDevices && now.Sub(b.lastFull) >= time.Second {
+			b.lastFull = now
+			for oldKey, old := range b.devices {
+				if old.active == 0 && now.Sub(old.last) >= g.loss.balanceIdle {
+					delete(b.devices, oldKey)
+				}
+			}
+		}
+		if len(b.devices) < balanceDevices {
+			b.devices[key] = device
+		}
 	}
 	// a device busy or idle for less than balance_idle keeps its member while it is up, in the
 	// balance or not; one idle longer is given the member its address falls on now, which

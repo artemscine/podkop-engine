@@ -512,6 +512,91 @@ func TestBalanceTakeOver(t *testing.T) {
 	require.NotEqual(t, "c", memberOf(newTest, newGroup, onC))
 }
 
+// A hot swap undone gives the balancer back: the group of before, which runs on, balances its
+// devices as before, and the group that had taken it is left an empty one.
+func TestBalanceGiveBack(t *testing.T) {
+	a, b, c := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking), newTestMember(C.TypeSOCKS, "c", dialWorking)
+	oldTest, oldGroup := newModeGroup(t, modeBalance, members(a, b, c), map[string]uint16{"a": 100, "b": 110, "c": 120}, nil)
+	target := balanceTarget(t)
+	memberOf := func(source string) string {
+		conn, err := oldTest.DialContext(sourceContext(source), N.NetworkTCP, target)
+		require.NoError(t, err)
+		conn.Close()
+		return oldGroup.balance.Load().devices[source].member.Tag()
+	}
+	onB := deviceOn(t, memberOf, "10.6.0.", "b")
+	newTest, newGroup := newModeGroup(t, modeBalance, members(a, b), nil, nil)
+	newGroup.history = oldGroup.history
+	newTest.TakeOver(oldTest)
+	require.Nil(t, oldGroup.balance.Load())
+	taken := newGroup.balance.Load()
+	newTest.GiveBack(oldTest)
+	require.Same(t, taken, oldGroup.balance.Load())
+	require.Contains(t, oldGroup.balance.Load().devices, onB, "the devices are back")
+	require.Equal(t, "b", memberOf(onB))
+	require.NotNil(t, newGroup.balance.Load())
+	require.NotSame(t, taken, newGroup.balance.Load())
+	require.Empty(t, newGroup.balance.Load().devices)
+	// given back once: a second call, or one for another group, changes nothing
+	newTest.GiveBack(oldTest)
+	require.Same(t, taken, oldGroup.balance.Load())
+	// a group that took nothing gives nothing
+	otherTest, otherGroup := newModeGroup(t, modeBalance, members(a, b), nil, nil)
+	own := otherGroup.balance.Load()
+	otherTest.GiveBack(oldTest)
+	require.Same(t, own, otherGroup.balance.Load())
+	require.Same(t, taken, oldGroup.balance.Load())
+}
+
+// A balance remembers balanceDevices devices at most: past it the devices idle for balance_idle
+// go, and a device there is no room for still gets a member, the one its address falls on.
+func TestBalanceDevicesBounded(t *testing.T) {
+	a, b := newTestMember(C.TypeSOCKS, "a", dialWorking), newTestMember(C.TypeSOCKS, "b", dialWorking)
+	_, group := newModeGroup(t, modeBalance, members(a, b), map[string]uint16{"a": 100, "b": 110}, nil)
+	balance := group.balance.Load()
+	connect := func(source string) (string, func()) {
+		member, closed := group.balanced(sourceContext(source), N.NetworkTCP)
+		require.NotNil(t, member, source)
+		return member.Tag(), closed
+	}
+	// devices with a connection open fill the list: none of them may go
+	var open []func()
+	for i := 0; i < balanceDevices; i++ {
+		_, closed := connect(fmt.Sprint("10.", 16+i>>16, ".", i>>8&255, ".", i&255))
+		open = append(open, closed)
+	}
+	require.Len(t, balance.devices, balanceDevices)
+	for i := 0; i < 100; i++ {
+		source := fmt.Sprint("10.200.0.", i)
+		first, closed := connect(source)
+		closed()
+		again, closed := connect(source)
+		closed()
+		require.Equal(t, first, again, "the member its address falls on, each time")
+	}
+	require.Len(t, balance.devices, balanceDevices)
+	require.NotContains(t, balance.devices, "10.200.0.7")
+	// idle for balance_idle, they give their room
+	for _, closed := range open[:1000] {
+		closed()
+	}
+	balance.access.Lock()
+	for _, device := range balance.devices {
+		if device.active == 0 {
+			device.last = device.last.Add(-group.loss.balanceIdle)
+		}
+	}
+	balance.lastFull = time.Time{}
+	balance.access.Unlock()
+	_, closed := connect("10.200.0.7")
+	closed()
+	require.Contains(t, balance.devices, "10.200.0.7")
+	require.Len(t, balance.devices, balanceDevices-1000+1)
+	for _, closed := range open[1000:] {
+		closed()
+	}
+}
+
 // The members of a balance are referenced, not only the choice of the group: their idle
 // connections are kept.
 func TestBalanceReferences(t *testing.T) {

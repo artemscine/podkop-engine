@@ -128,7 +128,10 @@ type capture struct {
 	local   netip.AddrPort
 	remote  netip.AddrPort
 	stopped atomic.Bool
-	done    chan struct{}
+	// stoppedAt is the time of the stop by the clock the kernel stamps the packets with, in
+	// nanoseconds: set before stopped
+	stoppedAt atomic.Int64
+	done      chan struct{}
 
 	access  sync.Mutex
 	counter counter
@@ -257,15 +260,30 @@ func incomingFilter(local netip.AddrPort, remote netip.AddrPort) ([]unix.SockFil
 	return filter, nil
 }
 
+// drainLimit bounds the reading of what the socket still holds once the capture is stopped. Its
+// buffer (a megabyte, doubled by the kernel) holds some thousands of packets: on an x86 host the
+// capture read 480 thousand a second under a flood, and a stop under that flood took 12 ms
+// (TestCaptureStopUnderFlood). A far end that goes on sending, to a connection closed or not,
+// must not keep the capture, and the probe that waits for it, for good.
+const drainLimit = time.Second
+
 func (c *capture) run() {
 	defer close(c.done)
 	buffer := make([]byte, snapLength)
 	oob := make([]byte, unix.CmsgSpace(int(unsafe.Sizeof(unix.Timespec{}))))
+	var drainUntil time.Time
 	for {
 		flags := 0
 		if c.stopped.Load() {
-			// what came before the stop is read without waiting, then the capture ends
+			// what came before the stop is read without waiting, then the capture ends: when the
+			// socket is empty, at the first packet that came after the stop, or at drainLimit
 			flags = unix.MSG_DONTWAIT
+			now := time.Now()
+			if drainUntil.IsZero() {
+				drainUntil = now.Add(drainLimit)
+			} else if now.After(drainUntil) {
+				return
+			}
 		}
 		n, oobn, _, from, err := unix.Recvmsg(c.fd, buffer, oob, flags)
 		if err != nil {
@@ -277,15 +295,22 @@ func (c *capture) run() {
 			}
 			return
 		}
+		at, hasTime := packetTime(oob[:oobn])
+		if flags != 0 && hasTime && at.UnixNano() > c.stoppedAt.Load() {
+			return
+		}
 		link, isLink := from.(*unix.SockaddrLinklayer)
 		if !isLink || link.Pkttype == unix.PACKET_OUTGOING {
 			continue
 		}
-		at, hasTime := packetTime(oob[:oobn])
 		if !hasTime {
 			at = time.Now()
 		}
-		c.take(buffer[:n], link.Ifindex, at)
+		if !c.take(buffer[:n], link.Ifindex, at) {
+			// no stream of a probe (the counter is broken): nothing more is read, and the kernel
+			// drops what the socket has no room for
+			return
+		}
 	}
 }
 
@@ -307,10 +332,11 @@ func packetTime(oob []byte) (time.Time, bool) {
 
 // take counts an incoming packet of the connection: the addresses are checked here, and
 // only the first interface that brought one is believed (a packet may be seen on a device
-// and on the device under it).
-func (c *capture) take(packet []byte, index int, at time.Time) {
+// and on the device under it). It returns false when the counter is broken: the capture has
+// nothing more to read.
+func (c *capture) take(packet []byte, index int, at time.Time) bool {
 	if len(packet) < 20 {
-		return
+		return true
 	}
 	var (
 		source  netip.Addr
@@ -321,39 +347,42 @@ func (c *capture) take(packet []byte, index int, at time.Time) {
 	case 4:
 		headerLength := int(packet[0]&0x0f) * 4
 		if len(packet) < headerLength+20 {
-			return
+			return true
 		}
 		source = netip.AddrFrom4([4]byte(packet[12:16]))
 		tcp = packet[headerLength:]
 		payload = int(binary.BigEndian.Uint16(packet[2:4])) - headerLength - int(tcp[12]>>4)*4
 	case 6:
 		if len(packet) < 60 {
-			return
+			return true
 		}
 		source = netip.AddrFrom16([16]byte(packet[8:24]))
 		tcp = packet[40:]
 		payload = int(binary.BigEndian.Uint16(packet[4:6])) - int(tcp[12]>>4)*4
 	default:
-		return
+		return true
 	}
 	// the local address is not matched: a source NAT on the way rewrites it (incomingFilter)
 	if source != c.remote.Addr() ||
 		binary.BigEndian.Uint16(tcp[0:2]) != c.remote.Port() || binary.BigEndian.Uint16(tcp[2:4]) != c.local.Port() {
-		return
+		return true
 	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	if c.inIndex == 0 {
 		c.inIndex = index
 	} else if index != c.inIndex {
-		return
+		return true
 	}
 	c.counter.add(at, binary.BigEndian.Uint32(tcp[4:8]), payload)
+	return !c.counter.Broken
 }
 
-// stop ends the capture once the packets already taken are read, and returns what it
-// counted and how many packets the socket dropped.
+// stop ends the capture once the packets that came before it are read (run: within drainLimit,
+// whatever the far end sends meanwhile), and returns what it counted and how many packets the
+// socket dropped.
 func (c *capture) stop() (*counter, int) {
+	c.stoppedAt.CompareAndSwap(0, time.Now().UnixNano())
 	if c.stopped.Swap(true) {
 		return &counter{}, 0
 	}

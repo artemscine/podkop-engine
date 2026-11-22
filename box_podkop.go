@@ -78,6 +78,11 @@ type (
 	outboundSuccessor interface {
 		TakeOver(previous adapter.Outbound)
 	}
+	// outboundReturner gives back to the outbound it replaced what TakeOver took from it and
+	// that outbound cannot do without: the update is undone, and the outbound of before runs on
+	outboundReturner interface {
+		GiveBack(previous adapter.Outbound)
+	}
 	// retiringOutbound stops what it does on its own once it is replaced or taken out
 	retiringOutbound interface {
 		Retire()
@@ -227,10 +232,17 @@ func (s *Box) UpdateOutbounds(outbounds []option.Outbound, remove []string, limi
 		added    []string
 		removed  []adapter.Outbound
 	)
+	// tookOver: the new outbounds that took over from the one they replace (after TakeOver)
+	var tookOver []*hotEntry
 	rollback := func(cause error) error {
 		_, swapErr := s.outbound.SwapOutbounds(append(previous, removed...), added)
 		if swapErr != nil {
 			s.logger.Error("put back the outbounds of before: ", swapErr)
+		}
+		for _, entry := range slices.Backward(tookOver) {
+			if returner, isReturner := entry.outbound.(outboundReturner); isReturner {
+				returner.GiveBack(entry.previous)
+			}
 		}
 		closeEntries()
 		return cause
@@ -276,6 +288,7 @@ func (s *Box) UpdateOutbounds(outbounds []option.Outbound, remove []string, limi
 	for _, entry := range entries {
 		if successor, isSuccessor := entry.outbound.(outboundSuccessor); isSuccessor && entry.previous != nil {
 			successor.TakeOver(entry.previous)
+			tookOver = append(tookOver, entry)
 		}
 	}
 	for _, layer := range layers {

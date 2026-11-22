@@ -155,6 +155,10 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
 		return sample, E.Cause(ErrLossNotCounted, err)
 	}
 	switch {
+	case result.Broken:
+		// more holes in the sequence than a download at the window of the probe can have: packets
+		// that are not of its stream came with its addresses
+		return sample, E.Cause(ErrLossNotCounted, "the packets of the connection were no stream of a download")
 	case result.Dropped > 0:
 		return sample, E.Cause(ErrLossNotCounted, "the capture dropped ", result.Dropped, " packets")
 	case result.Bytes < received:

@@ -26,6 +26,9 @@ type Counts struct {
 	ReorderBytes int64 // bytes of holes filled soon: reordered
 	DupBytes     int64 // bytes that came twice
 	Unfilled     int64 // bytes of holes still open at the end
+	// Broken: the sequence was no stream of a probe (more holes open at once than maxHoles, or
+	// more fills than maxFills); the counter stopped there and the counts say nothing
+	Broken bool
 }
 
 // minReorderWindow is the least time a hole may take to fill and still be reordering: a
@@ -53,7 +56,9 @@ type fill struct {
 	bytes  int64
 }
 
-// counter follows the incoming sequence of one connection, packet by packet.
+// counter follows the incoming sequence of one connection, packet by packet. Its holes are in the
+// order of the sequence and apart from each other: a hole opens past the highest byte, and a
+// packet only takes from the holes there are.
 type counter struct {
 	started bool
 	base    uint32
@@ -63,13 +68,30 @@ type counter struct {
 	Counts
 }
 
+// The most a counter keeps. The capture takes every packet with the addresses of the connection,
+// whatever its sequence number: what the far end sends is not held to the window (the kernel drops
+// what is outside it, after the capture has seen it), and a far end that sends holes without end
+// must cost neither memory nor time.
+const (
+	// maxHoles is the most holes open at once. A sender that keeps to the window the probe offers
+	// has all its data that is not acknowledged within Window bytes after the first hole, and a
+	// hole takes a missing segment and one that came after it: seven holes with segments of 1448
+	// bytes, 19 with segments of 536 (the least MSS of IPv4, RFC 879). 256 holes are open only
+	// with segments of 40 bytes, which no download comes in.
+	maxHoles = Window / (2 * 40)
+	// maxFills is the most pieces of holes filled, in all: one for a segment that came late or
+	// out of order. The megabyte of the largest probe (urltest.LossProbeLarge) is 1957 segments
+	// of 536 bytes; were every one of them a fill, the count is still under this.
+	maxFills = 4096
+)
+
 // maxAhead bounds how far past the highest byte a packet may start: a sequence number
 // further away is not of this stream (an older packet, wrapped around).
 const maxAhead = 1 << 30
 
 // add takes an incoming packet with payload bytes of data starting at seq, captured at at.
 func (c *counter) add(at time.Time, seq uint32, payload int) {
-	if payload <= 0 {
+	if payload <= 0 || c.Broken {
 		return
 	}
 	if !c.started {
@@ -82,6 +104,10 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
 	end := start + int64(payload)
 	c.Packets++
 	if start > c.highest {
+		if len(c.holes) >= maxHoles {
+			c.broken()
+			return
+		}
 		c.holes = append(c.holes, hole{c.highest, start, at})
 		c.Holes++
 		c.highest = end
@@ -89,33 +115,62 @@ func (c *counter) add(at time.Time, seq uint32, payload int) {
 	}
 	limit := min(end, c.highest)
 	covered := int64(0)
-	// a new list: a packet inside a hole splits it in two, and a list filtered in place would
-	// write the second piece over the next hole before it is read
-	kept := make([]hole, 0, len(c.holes)+1)
-	for _, h := range c.holes {
+	// the holes are filtered in place: a packet leaves at most one piece of each hole it reaches,
+	// but for one that lies inside a single hole and splits it in two (it reaches no other hole)
+	kept := 0
+	for index := 0; index < len(c.holes); index++ {
+		h := c.holes[index]
 		from, to := max(start, h.start), min(limit, h.end)
 		if from >= to {
-			kept = append(kept, h)
+			c.holes[kept] = h
+			kept++
 			continue
+		}
+		if len(c.fills) >= maxFills {
+			c.broken()
+			return
 		}
 		covered += to - from
 		c.fills = append(c.fills, fill{packet: c.Packets, age: at.Sub(h.at), bytes: to - from})
-		if h.start < from {
-			kept = append(kept, hole{h.start, from, h.at})
-		}
-		if to < h.end {
-			kept = append(kept, hole{to, h.end, h.at})
+		switch {
+		case h.start < from && to < h.end:
+			// inside the hole: every hole before it was kept as it is (kept == index), and the
+			// holes after it move up by one
+			if len(c.holes) >= maxHoles {
+				c.broken()
+				return
+			}
+			c.holes = append(c.holes, hole{})
+			copy(c.holes[index+2:], c.holes[index+1:])
+			c.holes[index] = hole{h.start, from, h.at}
+			c.holes[index+1] = hole{to, h.end, h.at}
+			kept = len(c.holes)
+			index = len(c.holes)
+		case h.start < from:
+			c.holes[kept] = hole{h.start, from, h.at}
+			kept++
+		case to < h.end:
+			c.holes[kept] = hole{to, h.end, h.at}
+			kept++
 		}
 	}
-	c.holes = kept
+	c.holes = c.holes[:kept]
 	c.DupBytes += (limit - start) - covered
 	if end > c.highest {
 		c.highest = end
 	}
 }
 
+// broken ends the counting: the sequence is no stream of a probe (maxHoles, maxFills). What was
+// kept is let go, and every later packet is passed over.
+func (c *counter) broken() {
+	c.Broken = true
+	c.holes, c.fills = nil, nil
+}
+
 // finish returns the counts of the connection so far, the holes filled within window
-// counted as reordering, the others as loss.
+// counted as reordering, the others as loss. Of a broken counter, only Broken and Packets tell
+// anything.
 func (c *counter) finish(window time.Duration) Counts {
 	counts := c.Counts
 	counts.Bytes = c.highest

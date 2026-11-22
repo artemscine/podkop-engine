@@ -32,8 +32,11 @@ type prober struct {
 	spacing time.Duration
 	access  sync.Mutex
 	calls   map[probeKey]*probeCall
-	// when the next test through a first server may begin
-	hops map[any]time.Time
+	// when the next test through a first server may begin; a time that has passed says nothing,
+	// and is dropped once in spacing (pruned: when last), so that the outbound it is kept by is
+	// let go when the configuration replaces it
+	hops   map[any]time.Time
+	pruned time.Time
 }
 
 type probeKey struct {
@@ -137,7 +140,8 @@ func (p *prober) reserve(hop any, now time.Time) time.Duration {
 	if next, reserved := p.hops[hop]; reserved && now.Before(next) {
 		return next.Sub(now)
 	}
-	if len(p.hops) > 1024 {
+	if now.Sub(p.pruned) >= p.spacing || now.Before(p.pruned) {
+		p.pruned = now
 		for key, next := range p.hops {
 			if !now.Before(next) {
 				delete(p.hops, key)

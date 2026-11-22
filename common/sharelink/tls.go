@@ -1,11 +1,14 @@
 package sharelink
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/json/badoption"
 )
 
 // The fingerprints sing-box knows by these names (common/tls/utls_client.go).
@@ -68,8 +71,9 @@ func (d *decoder) utlsOf(fingerprint string, reality bool) (*option.OutboundUTLS
 	return &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint}, nil
 }
 
-// The parameters of TLS every scheme reads the same way.
-func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
+// The parameters of TLS every scheme reads the same way. With REALITY no certificate is
+// verified, and a pin the link carries along is left out without a word.
+func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions, reality bool) {
 	d.reads("sni", "servername", "peer", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify",
 		"alpn", "disable_sni", "nosni", "cert", "ech", "pcs", "pinsha256", "vcn", "cs")
 	tlsOptions.Enabled = true
@@ -86,20 +90,8 @@ func (d *decoder) tlsCommon(tlsOptions *option.OutboundTLSOptions) {
 		tlsOptions.Certificate = strings.Split(strings.ReplaceAll(certificate, "\r\n", "\n"), "\n")
 	}
 	tlsOptions.ECH = d.ech()
-	if d.first("pcs", "pinsha256") != "" && !tlsOptions.Insecure && len(tlsOptions.Certificate) == 0 {
-		// Xray and Hysteria pin the hash of a certificate, sing-box that of a public key:
-		// one cannot be made from the other
-		d.warn("the pinned certificate (pcs, pinSHA256) is not supported: the server is verified against the system roots, and one with a self-signed certificate is refused")
-	}
-	if names := splitList(d.query["vcn"]); len(names) > 0 && !tlsOptions.Insecure {
-		// Xray verifies the certificate by these names instead of the one it sends
-		same := false
-		for _, name := range names {
-			same = same || strings.EqualFold(name, tlsOptions.ServerName)
-		}
-		if !same {
-			d.warn("vcn (the names the certificate is verified by) is not supported: the certificate is verified by the server name of TLS, and a server with a certificate for another name is refused")
-		}
+	if !reality {
+		d.verification(tlsOptions, d.first("pcs", "pinsha256"), d.query["vcn"])
 	}
 	if d.query["cs"] != "" {
 		d.warn("cs (the cipher suites of TLS) is not supported and is ignored")
@@ -163,7 +155,7 @@ func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions, 
 		return nil, refuse("security", "unsupported security", shown(security))
 	}
 	tlsOptions := new(option.OutboundTLSOptions)
-	d.tlsCommon(tlsOptions)
+	d.tlsCommon(tlsOptions, security == "reality")
 	var err error
 	tlsOptions.UTLS, err = d.utls(security == "reality")
 	if err != nil {
@@ -193,6 +185,64 @@ func (d *decoder) security(defaultSecurity string) (*option.OutboundTLSOptions, 
 // "fp" read it themselves.
 func (d *decoder) tlsAlways() *option.OutboundTLSOptions {
 	tlsOptions := new(option.OutboundTLSOptions)
-	d.tlsCommon(tlsOptions)
+	d.tlsCommon(tlsOptions, false)
 	return tlsOptions
+}
+
+// certificateHashes reads the pins of Xray's pcs and Hysteria's pinSHA256: SHA-256 hashes in
+// hexadecimal, with or without colons, separated by commas (infra/conf of Xray-core). The
+// message names no hash: a pin is part of the link.
+// verification reads how Xray and Hysteria verify the server's certificate, as this engine
+// verifies it too (podkop-engine, 0702): pins (pcs, pinnedPeerCertSha256 of Xray; pinSHA256 of
+// Hysteria) are the SHA-256 of a whole certificate, the leaf or a CA of the chain, as
+// certificate_sha256 takes them; the pin is the check, with insecure as well (Hysteria checks it
+// then, and Xray no longer has insecure). vcn (verifyPeerCertByName) names what the certificate
+// is verified by instead of the name sent, as certificate_server_name does. With a certificate of
+// the link a pin is not taken: that certificate is the root.
+func (d *decoder) verification(tlsOptions *option.OutboundTLSOptions, pins string, names string) {
+	if pins != "" && len(tlsOptions.Certificate) == 0 {
+		hashes, err := certificateHashes(pins)
+		if err != nil {
+			if tlsOptions.Insecure {
+				d.warn("the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (", err.Error(), "): the server is not verified")
+			} else {
+				d.warn("the pinned certificate (pcs, pinSHA256) cannot be read and is ignored (", err.Error(), "): the server is verified against the system roots")
+			}
+		} else {
+			tlsOptions.CertificateSHA256 = hashes
+			tlsOptions.Insecure = false
+		}
+	}
+	if list := splitList(names); len(list) > 0 && !tlsOptions.Insecure {
+		same := true
+		for _, name := range list {
+			same = same && strings.EqualFold(name, tlsOptions.ServerName)
+		}
+		if !same {
+			tlsOptions.CertificateServerName = list
+		}
+	}
+}
+
+func certificateHashes(text string) (badoption.Listable[[]byte], error) {
+	var hashes badoption.Listable[[]byte]
+	for _, entry := range strings.Split(text, ",") {
+		// OpenSSL's colons; Hysteria takes dashes too
+		entry = strings.NewReplacer(":", "", "-", "").Replace(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		hash, err := hex.DecodeString(entry)
+		if err != nil {
+			return nil, E.New("a hash is not hexadecimal")
+		}
+		if len(hash) != sha256.Size {
+			return nil, E.New("a hash is not 32 bytes long")
+		}
+		hashes = append(hashes, hash)
+	}
+	if len(hashes) == 0 {
+		return nil, E.New("no hash")
+	}
+	return hashes, nil
 }

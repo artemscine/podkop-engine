@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,4 +96,48 @@ func (f DialerFunc) DialContext(ctx context.Context, network string, destination
 
 func (f DialerFunc) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	return nil, errors.New("no UDP")
+}
+
+// A test reads probeHeaderLimit of response headers at most: an answer whose headers go on
+// (they come through the member tested) fails the test, and is not kept in memory.
+func TestProbeHeadersBounded(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { listener.Close() })
+	var sent atomic.Int64
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				conn.Read(make([]byte, 4096))
+				conn.Write([]byte("HTTP/1.1 204 No Content\r\nX-Filler: "))
+				filler := make([]byte, 16<<10)
+				for i := range filler {
+					filler[i] = 'a'
+				}
+				for {
+					n, err := conn.Write(filler)
+					sent.Add(int64(n))
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	plain := DialerFunc(func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, destination.String())
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = URLTest(ctx, "http://"+listener.Addr().String()+"/", plain)
+	require.ErrorContains(t, err, "response headers exceeded")
+	require.Less(t, time.Since(start), 4*time.Second, "the test read the headers until its time was up")
+	// what the client took before it gave up: the limit and what was on the way, not megabytes
+	require.Less(t, sent.Load(), int64(probeHeaderLimit+(4<<20)))
 }

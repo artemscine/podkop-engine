@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group/urltestgroup"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
@@ -32,17 +33,20 @@ import (
 // start, and records its close.
 type testServer struct {
 	outbound.Adapter
-	fail   bool
-	closed atomic.Bool
+	fail     bool
+	failLate bool
+	closed   atomic.Bool
 }
 
 type testServerOptions struct {
-	Fail    bool `json:"fail,omitempty"`
-	Version int  `json:"version,omitempty"`
+	Fail bool `json:"fail,omitempty"`
+	// FailLate fails the stage after the start, once the groups of the update have taken over
+	FailLate bool `json:"fail_late,omitempty"`
+	Version  int  `json:"version,omitempty"`
 }
 
 func newTestServer(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options testServerOptions) (adapter.Outbound, error) {
-	return &testServer{Adapter: outbound.NewAdapter("testserver", tag, []string{N.NetworkTCP, N.NetworkUDP}, nil), fail: options.Fail}, nil
+	return &testServer{Adapter: outbound.NewAdapter("testserver", tag, []string{N.NetworkTCP, N.NetworkUDP}, nil), fail: options.Fail, failLate: options.FailLate}, nil
 }
 
 func (s *testServer) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -55,6 +59,10 @@ func (s *testServer) Start(stage adapter.StartStage, scope *adapter.Scope) error
 	case adapter.StartStateStart:
 		if s.fail {
 			return E.New("this server does not start")
+		}
+	case adapter.StartStatePostStart:
+		if s.failLate {
+			return E.New("this server fails after its start")
 		}
 	}
 	return nil
@@ -289,6 +297,32 @@ func TestUpdateOutboundsRollsBack(t *testing.T) {
 	// the group before still works
 	_, err = g.(adapter.URLTestGroup).URLTest(context.Background())
 	require.NoError(t, err)
+}
+
+// An update undone after the new group took over from the one it replaces gives that one its
+// balancer back: put back in its place, it balances on.
+func TestUpdateOutboundsGivesTheBalanceBack(t *testing.T) {
+	h := newHotTest(t)
+	balance := func(members ...string) string {
+		return `{"type": "urltest", "tag": "b", "outbounds": ["` + strings.Join(members, `", "`) + `"], "url": "` + h.link +
+			`", "interval": "1m", "mode": "balance", "loss_url": "` + h.link + `"}`
+	}
+	_, err := h.update(balance("s1", "s2"), nil, 0)
+	require.NoError(t, err)
+	group := h.outbound("b")
+	balancing := func() bool {
+		return group.(interface {
+			Balance() []urltestgroup.BalanceMember
+		}).Balance() != nil
+	}
+	require.True(t, balancing())
+
+	_, err = h.update(`{"type": "testserver", "tag": "s4", "fail_late": true}, `+balance("s1", "s2", "s4"), nil, 0)
+	require.ErrorContains(t, err, "fails after its start")
+	require.Same(t, group, h.outbound("b"))
+	_, loaded := h.box.Outbound().Outbound("s4")
+	require.False(t, loaded)
+	require.True(t, balancing(), "the group of before lost its balancer to the one that was undone")
 }
 
 // An outbound replaced is kept while a connection in the list goes through it, and not

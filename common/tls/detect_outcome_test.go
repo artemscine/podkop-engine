@@ -386,6 +386,57 @@ func TestDetectOutcomeFailureAfterRestart(t *testing.T) {
 	require.Equal(t, 2, cache.outcomeWriteCount())
 }
 
+// A state that changes with every handshake is written detectOutcomeWriteBurst times at once, then
+// once in detectOutcomeWriteEvery, the latest state; after a quiet time the changes are written
+// at once again.
+func TestDetectOutcomeWriteRate(t *testing.T) {
+	every := detectOutcomeWriteEvery
+	detectOutcomeWriteEvery = 100 * time.Millisecond
+	t.Cleanup(func() { detectOutcomeWriteEvery = every })
+	cache := &choiceCache{choices: make(map[string]choiceEntry)}
+	writer := new(detectOutcomeWriter)
+	writer.open(cache, "key")
+	answer := func(fingerprint string) {
+		writer.answered(time.Now(), func(byte, string) (byte, string) { return 0, fingerprint })
+	}
+	start := time.Now()
+	changes := 0
+	for time.Since(start) < 450*time.Millisecond {
+		if changes%2 == 0 {
+			writer.failed(time.Now(), adapter.DetectFailed)
+		} else {
+			answer("chrome")
+		}
+		changes++
+		time.Sleep(time.Millisecond)
+	}
+	answer("firefox")
+	entry := outcomeOf(t, cache, writer)
+	require.Zero(t, entry.flags)
+	require.Equal(t, "firefox", entry.fingerprint)
+	writes := cache.outcomeWriteCount()
+	require.GreaterOrEqual(t, changes, 100)
+	// the burst at once, one for each 100 ms of the 450, and the last state
+	require.GreaterOrEqual(t, writes, detectOutcomeWriteBurst+1)
+	require.LessOrEqual(t, writes, detectOutcomeWriteBurst+6)
+
+	time.Sleep(time.Duration(detectOutcomeWriteBurst)*detectOutcomeWriteEvery + 50*time.Millisecond)
+	for index := 1; index <= detectOutcomeWriteBurst; index++ {
+		if index%2 == 1 {
+			writer.failed(time.Now(), adapter.DetectNoAnswer)
+		} else {
+			answer("firefox")
+		}
+		require.Eventually(t, func() bool { return cache.outcomeWriteCount() == writes+index }, 50*time.Millisecond, time.Millisecond)
+	}
+	// the next change waits for its turn, and is written
+	writer.failed(time.Now(), adapter.DetectFailed)
+	time.Sleep(20 * time.Millisecond)
+	require.Equal(t, writes+detectOutcomeWriteBurst, cache.outcomeWriteCount())
+	require.Equal(t, adapter.DetectFailed, outcomeOf(t, cache, writer).flags)
+	require.Equal(t, writes+detectOutcomeWriteBurst+1, cache.outcomeWriteCount())
+}
+
 // blockingCache holds the writes until told to go on, and watches how many run at once.
 type blockingCache struct {
 	choiceCache
@@ -434,6 +485,10 @@ func TestDetectOutcomeWriterOrder(t *testing.T) {
 // verification is a failure at once, and nothing is written when nothing changes.
 func TestDetectOutcomeFallbackOff(t *testing.T) {
 	setFallback(t, false)
+	// nine changes in a row, to see each recorded: the bound of the writes has its own test
+	every := detectOutcomeWriteEvery
+	detectOutcomeWriteEvery = 0
+	t.Cleanup(func() { detectOutcomeWriteEvery = every })
 	cache := &choiceCache{choices: make(map[string]choiceEntry)}
 	ctx := service.ContextWith[adapter.CacheFile](context.Background(), adapter.CacheFile(cache))
 	config, _ := fallbackClientIn(t, ctx, "chrome", true)

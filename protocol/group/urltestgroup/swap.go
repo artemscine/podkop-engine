@@ -91,6 +91,17 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 	g.hotStart = true
 }
 
+// GiveBack returns to the group this one replaced what TakeOver took from it, when the update
+// that put this group in its place is undone: its balancer, with the devices. The rest TakeOver
+// only read.
+func (s *URLTest) GiveBack(previous adapter.Outbound) {
+	old, isURLTest := previous.(*URLTest)
+	if !isURLTest || old.group == nil || s.group == nil {
+		return
+	}
+	s.group.returnBalance(old.group)
+}
+
 // Retire stops the group for good: no round, no selection, no judgement of a member from a
 // connection that failed. The connections it carries go on through the members they have.
 func (s *URLTest) Retire() {
