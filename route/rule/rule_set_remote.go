@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -203,7 +202,7 @@ func (s *RemoteRuleSet) loadCached() {
 
 // startWithNothingLoaded starts a set that has neither a cached nor an initial content.
 func (s *RemoteRuleSet) startWithNothingLoaded(ctx context.Context) {
-	if ruleSetStartEmpty() {
+	if remoteStartEmpty(s.ctx) {
 		// nothing waits for the download: the inbounds start now, the updater fetches the
 		// set right after the start and the callbacks tell who needs to know
 		s.logger.Info("initial rule-set: ", s.tag, ", nothing cached: starting empty, downloading in the background")
@@ -217,18 +216,6 @@ func (s *RemoteRuleSet) startWithNothingLoaded(ctx context.Context) {
 		s.logger.Error("initial rule-set: ", s.tag, ", starting empty and retrying: ", logText(err))
 		s.startEmpty()
 	}
-}
-
-// ruleSetStartEmpty tells whether a remote rule-set with nothing cached and no initial
-// file starts empty at once instead of downloading its list during the start
-// (SING_BOX_RULE_SET_START_EMPTY set to anything). The start downloads the sets five at
-// a time, each up to the start deadline, and the inbounds wait for all of them: a box
-// that replaces another one (a program that applies a new configuration, a restart) is
-// deaf for that long. Starting empty, the box answers at once and the rules that use
-// the set match nothing until the download comes; what they would have matched in the
-// meantime goes by the other rules.
-var ruleSetStartEmpty = func() bool {
-	return os.Getenv("SING_BOX_RULE_SET_START_EMPTY") != ""
 }
 
 // startEmpty marks a set that starts without content; the updater fetches it at once

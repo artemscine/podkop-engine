@@ -19,7 +19,8 @@ import (
 // fastest (the default) chooses by the delay of the URL tests, as before. loss chooses by
 // the delay weighed by the loss loss probes counted (urltest.LossProbe): the members it may
 // switch to and the member in use are probed once a loss_interval with LossProbeSmall bytes,
-// and a member the group would switch to without a fresh count first with LossProbeLarge.
+// and a member the group would switch to without a fresh count first with LossProbeLarge. A group
+// that carries no connections probes nothing (urltest_use.go).
 // balance spreads the connections over the best members by their source address
 // (urltest_balance.go), leaving out a member that loses more than loss_threshold percent.
 //
@@ -286,12 +287,16 @@ func (g *URLTestGroup) lossDue(tag string) bool {
 	return !g.lossResting(tag)
 }
 
-// needsSwitchProbe tells whether a member the group would switch to is probed first: it can
-// be counted, no probe before a switch to it ran within the rest (one that counted too little
-// to decide by, a slow path cut by the time limit, would be made again at every selection),
-// no probe of it failed within the rest (a URL that answers a status through it would hold it
-// back for good), and it has no count to decide by fresher than the interval.
+// needsSwitchProbe tells whether a member the group would switch to is probed first: the group is
+// in use (urltest_use.go), the member can be counted, no probe before a switch to it ran within the
+// rest (one that counted too little to decide by, a slow path cut by the time limit, would be made
+// again at every selection), no probe of it failed within the rest (a URL that answers a status
+// through it would hold it back for good), and it has no count to decide by fresher than the
+// interval.
 func (g *URLTestGroup) needsSwitchProbe(tag string) bool {
+	if !g.inUse() {
+		return false
+	}
 	if notCounted := g.history.LossNotCounted(tag); !notCounted.IsZero() && time.Since(notCounted) < lossNotCountedRest {
 		return false
 	}
@@ -312,6 +317,9 @@ func (g *URLTestGroup) needsSwitchProbe(tag string) bool {
 // lossSlotWait bounds how long a probe waits for the probes of other groups.
 const lossSlotWait = 30 * time.Second
 
+// lossProbeTime bounds a probe once it has its turn.
+const lossProbeTime = urltest.LossProbeTimeout + 5*time.Second
+
 // probeLoss runs a loss probe of size bytes through member and keeps what it counted; it
 // reports whether a count was kept. A probe that kept none is recorded: the next one waits
 // the rest, and only the first failure in a row is a warning.
@@ -331,7 +339,7 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
 	}
 	// the probe's own time, after the wait: a megabyte at the window of the probe over a far
 	// path takes most of it
-	ctx, cancel := context.WithTimeout(g.ctx, urltest.LossProbeTimeout+5*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, lossProbeTime)
 	defer cancel()
 	// a new connection to the first server of the member, like a URL test (probes)
 	if probes.waitHop(ctx, firstHop(g.outbound, member)) != nil {
@@ -373,18 +381,31 @@ func (g *URLTestGroup) probeLoss(tag string, member adapter.Outbound, size int64
 	return false
 }
 
+// switchProbeRuns tells whether a probe before a switch to a member runs: what it counts is
+// waited for, the member is not "probed lately" yet (needsSwitchProbe). A probe ends within its
+// time, whatever the far end does; one that did not (a dial that does not end with its context)
+// holds back no switch any longer.
+func (g *URLTestGroup) switchProbeRuns(tag string) bool {
+	started, running := g.switchProbes.Load(tag)
+	return running && time.Since(started.(time.Time)) < lossSlotWait+lossProbeTime
+}
+
 // startSwitchProbe probes, in the background, a member the group would switch to, and asks
 // for a selection once the probe is done: the selection does not wait for it (a megabyte
 // may take half a minute, and a member in use that goes down meanwhile is left at once). One
 // probe of a member at a time.
 func (g *URLTestGroup) startSwitchProbe(tag string, member adapter.Outbound) {
-	if _, running := g.switchProbes.LoadOrStore(tag, struct{}{}); running {
-		return
+	started := time.Now()
+	if earlier, running := g.switchProbes.LoadOrStore(tag, started); running {
+		if g.switchProbeRuns(tag) || !g.switchProbes.CompareAndSwap(tag, earlier, started) {
+			return
+		}
 	}
-	g.switchProbed.Store(tag, time.Now())
+	g.switchProbed.Store(tag, started)
 	go func() {
-		defer g.switchProbes.Delete(tag)
 		g.probeLoss(tag, member, urltest.LossProbeLarge, false)
+		// before the selection it asks for, which would wait for it
+		g.switchProbes.CompareAndDelete(tag, started)
 		if g.ctx.Err() == nil {
 			g.requestUpdateCheck()
 		}
@@ -418,20 +439,25 @@ func (g *URLTestGroup) lossTargets() []adapter.Outbound {
 }
 
 // lossRound runs the periodic probes of the members that are due, after a round, in the
-// background: one round of probes at a time. A count kept asks for a selection.
+// background: one round of probes at a time, while the group is in use (urltest_use.go). A count
+// kept asks for a selection.
 func (g *URLTestGroup) lossRound() {
-	if g.mode == modeFastest || g.closed.Load() || !g.lossRunning.CompareAndSwap(false, true) {
+	if g.mode == modeFastest || g.closed.Load() || !g.inUse() || !g.lossRunning.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer g.lossRunning.Store(false)
 		counted := false
 		for _, member := range g.lossTargets() {
-			if g.ctx.Err() != nil || g.networkPaused() {
+			if g.ctx.Err() != nil || g.networkPaused() || !g.inUse() {
 				return
 			}
 			tag := basegroup.RealTag(member, N.NetworkTCP)
 			if !g.lossDue(tag) {
+				continue
+			}
+			if g.lossProbeSize(tag) == urltest.LossProbeLarge {
+				g.firstLossProbe(tag, member)
 				continue
 			}
 			if g.probeLoss(tag, member, urltest.LossProbeSmall, true) {

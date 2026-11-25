@@ -73,8 +73,6 @@ const (
 	realityHybridKeyShareNote = "REALITY servers since Xray-core v26.9.8 reject a Client Hello without an X25519MLKEM768 key share"
 	// what to configure in place of such a fingerprint
 	realityHybridKeyShareAdvice = ", use chrome, firefox, safari, random or randomized"
-	// the text every failed verification begins with
-	realityVerificationFailed = "reality verification failed"
 )
 
 // realityStrangerError is the failure of a handshake with a fingerprint without the
@@ -107,23 +105,15 @@ func checkRealityFingerprint(name string) (classic bool, err error) {
 // handshake itself failed with, if it did. It names the fingerprint that may be the
 // cause, and what to configure in its place when it is the configured one.
 func (e *RealityClientConfig) verificationFailed(cause error) error {
-	text := realityVerificationFailed
-	if e.classicFingerprint != "" {
-		text += ", possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
-		if !e.classicFallback {
-			text += realityHybridKeyShareAdvice
-		}
+	failure := &realityVerifyError{cause: cause}
+	if e.classicFingerprint == "" {
+		return failure
 	}
-	var err error
-	if cause != nil {
-		err = E.Cause(cause, text)
-	} else {
-		err = E.New(text)
+	failure.note = ", possibly because of the uTLS fingerprint " + e.classicFingerprint + ": " + realityHybridKeyShareNote
+	if !e.classicFallback {
+		failure.note += realityHybridKeyShareAdvice
 	}
-	if e.classicFingerprint != "" {
-		return &realityStrangerError{err}
-	}
-	return err
+	return &realityStrangerError{failure}
 }
 
 func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
@@ -212,7 +202,7 @@ func (e *RealityClientConfig) recordDetectOutcome(ctx context.Context, destinati
 	if cache == nil {
 		return
 	}
-	e.outcome.open(cache, e.fingerprint+" "+e.ServerName()+" "+destination.String())
+	e.outcome.open(cache, adapter.DetectOutcomeKey(e.fingerprint, e.ServerName(), destination))
 	now := time.Now()
 	switch {
 	case handshakeErr == nil:
@@ -256,13 +246,11 @@ func callerEnded(ctx context.Context) bool {
 // the verification of REALITY, or of the certificate of the target it passed the connection on to.
 func realityVerificationError(err error) bool {
 	var (
-		stranger         *realityStrangerError
 		unknownAuthority x509.UnknownAuthorityError
 		hostname         x509.HostnameError
 		invalid          x509.CertificateInvalidError
 	)
-	return errors.As(err, &stranger) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalid) ||
-		strings.Contains(err.Error(), realityVerificationFailed)
+	return errors.Is(err, ErrRealityVerification) || errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalid)
 }
 
 func (e *RealityClientConfig) NextProtos() []string {

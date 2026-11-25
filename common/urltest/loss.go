@@ -106,6 +106,7 @@ func LossProbe(ctx context.Context, link string, size int64, detour N.Dialer) (L
 			port = "443"
 		}
 	}
+	ctx = ContextWithTest(ctx)
 	probeCtx, socket := probesock.With(ctx, probesock.Window)
 	defer socket.Close()
 	start := time.Now()

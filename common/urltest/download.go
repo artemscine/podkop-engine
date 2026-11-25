@@ -44,6 +44,7 @@ func DownloadTest(ctx context.Context, link string, detour N.Dialer) (received i
 			port = "443"
 		}
 	}
+	ctx = ContextWithTest(ctx)
 	start := time.Now()
 	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {

@@ -2,7 +2,6 @@ package urltestgroup
 
 import (
 	"context"
-	basegroup "github.com/sagernet/sing-box/protocol/group"
 	"hash/fnv"
 	"slices"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	basegroup "github.com/sagernet/sing-box/protocol/group"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -29,8 +29,9 @@ import (
 // The members of the balance are at most balance_size outbounds that are up, whose delay
 // (weighed by loss as in the mode loss) is within the tolerance of the best of them, and whose
 // loss, less the loss of the line, is not over loss_threshold. A member comes in only once it
-// has passed the download test, as the member a selection switches to. When none is in, the
-// group goes by its plain choice, the fastest.
+// has passed the download test, as the member a selection switches to; at the moment the group
+// comes into use, before. When none is in, and while the group is not in use, the group goes by
+// its plain choice, the fastest.
 
 const (
 	defaultBalanceSize = 3
@@ -54,6 +55,8 @@ type balancer struct {
 	access    sync.Mutex
 	tcp       []adapter.Outbound // the members of the balance for TCP, the best first
 	udp       []adapter.Outbound
+	unchecked []adapter.Outbound // those of tcp whose download test has not run since they came in (startUse)
+	told      string             // the members the log told last
 	devices   map[string]*balanceDevice
 	lastSweep time.Time
 	// lastFull: when the devices idle for balance_idle were last dropped for room (balanceDevices)
@@ -103,15 +106,19 @@ func (g *URLTestGroup) balanceMembers(network string, view lossView, skip map[st
 
 // updateBalance chooses the members of the balance anew, after a selection (under
 // updateAccess). A member that was not in the balance passes the download test before it
-// comes in: a server frozen after 16 KB would hang the large downloads of its devices.
+// comes in: a server frozen after 16 KB would hang the large downloads of its devices. One that
+// passed it within the loss_interval is not tested again. A group that is not in use has no
+// balance (urltest_rest.go).
 func (g *URLTestGroup) updateBalance() {
 	b := g.balance.Load()
-	if g.mode != modeBalance || b == nil {
+	if g.mode != modeBalance || b == nil || g.restBalance(b) {
 		return
 	}
 	view := g.lossView()
 	b.access.Lock()
-	previous := slices.Clone(b.tcp)
+	previous := slices.DeleteFunc(slices.Clone(b.tcp), func(member adapter.Outbound) bool {
+		return slices.Contains(b.unchecked, member)
+	})
 	b.access.Unlock()
 	failed := make(map[string]bool)
 	tested := make(map[string]bool)
@@ -121,7 +128,7 @@ func (g *URLTestGroup) updateBalance() {
 		again := false
 		for _, member := range tcp {
 			tag := basegroup.RealTag(member, N.NetworkTCP)
-			if g.downloadLink == "" || member.Type() == C.TypeBlock || slices.Contains(previous, member) || tested[tag] {
+			if g.downloadLink == "" || member.Type() == C.TypeBlock || slices.Contains(previous, member) || tested[tag] || g.downloadPassed(tag) {
 				continue
 			}
 			tested[tag] = true
@@ -140,19 +147,42 @@ func (g *URLTestGroup) updateBalance() {
 		}
 	}
 	udp := g.balanceMembers(N.NetworkUDP, view, failed)
-	b.access.Lock()
-	changed := !slices.Equal(tcp, b.tcp) || !slices.Equal(udp, b.udp)
-	b.tcp, b.udp = tcp, udp
-	b.access.Unlock()
+	if g.restBalance(b) {
+		// the download tests took longer than the use
+		return
+	}
+	g.useStart.Lock()
+	changed := g.putBalance(b, tcp, udp, nil)
+	g.useStart.Unlock()
 	if changed {
-		tags := make([]string, len(tcp))
-		for i, member := range tcp {
-			tags[i] = member.Tag()
-		}
-		g.logger.Info("balance over ", len(tags), " outbounds: ", strings.Join(tags, ", "))
 		// the members in use changed: the manager of idle connections keeps theirs
 		g.notifyHistory()
 	}
+}
+
+// putBalance puts members in the balance, those of unchecked to be download tested, and tells
+// whether that changed it. A balance another group took (a hot swap) is left as it is. The caller
+// holds useStart.
+func (g *URLTestGroup) putBalance(b *balancer, tcp []adapter.Outbound, udp []adapter.Outbound, unchecked []adapter.Outbound) bool {
+	tags := make([]string, len(tcp))
+	for i, member := range tcp {
+		tags[i] = member.Tag()
+	}
+	told := strings.Join(tags, ", ")
+	b.access.Lock()
+	if g.balance.Load() != b {
+		b.access.Unlock()
+		return false
+	}
+	changed := !slices.Equal(tcp, b.tcp) || !slices.Equal(udp, b.udp)
+	b.tcp, b.udp, b.unchecked = tcp, udp, unchecked
+	news := told != b.told
+	b.told = told
+	b.access.Unlock()
+	if news {
+		g.logger.Info("balance over ", len(tags), " outbounds: ", told)
+	}
+	return changed
 }
 
 // takeBalance hands the balancer of a group that is replaced to its successor (a hot swap):
@@ -177,7 +207,7 @@ func (g *URLTestGroup) takeBalance(from *URLTestGroup) {
 		return kept
 	}
 	b.access.Lock()
-	b.tcp, b.udp = keep(b.tcp), keep(b.udp)
+	b.tcp, b.udp, b.unchecked = keep(b.tcp), keep(b.udp), keep(b.unchecked)
 	b.takenFrom = from
 	b.access.Unlock()
 	g.balance.Store(b)
@@ -306,8 +336,8 @@ func (g *URLTestGroup) balanced(ctx context.Context, network string) (adapter.Ou
 	}
 }
 
-// balanceReferences are the tags of the members the balance uses: those in it and those its
-// devices with connections still go by.
+// balanceReferences are the tags of the members the balance uses: those in it, while the group is
+// in use, and those its devices with connections still go by.
 func (g *URLTestGroup) balanceReferences() []string {
 	b := g.balance.Load()
 	if b == nil {
@@ -321,11 +351,13 @@ func (g *URLTestGroup) balanceReferences() []string {
 			tags = append(tags, member.Tag())
 		}
 	}
-	for _, member := range b.tcp {
-		add(member)
-	}
-	for _, member := range b.udp {
-		add(member)
+	if g.inUse() {
+		for _, member := range b.tcp {
+			add(member)
+		}
+		for _, member := range b.udp {
+			add(member)
+		}
 	}
 	for _, device := range b.devices {
 		if device.active > 0 {
@@ -347,14 +379,14 @@ type BalanceMember struct {
 }
 
 // Balance returns the members of the balance for TCP and the devices with open connections
-// on each; nil when the group does not balance.
+// on each; nil when the group does not balance, or its balance rests (urltest_rest.go).
 func (s *URLTest) Balance() []BalanceMember {
 	g := s.group
 	if g == nil {
 		return nil
 	}
 	b := g.balance.Load()
-	if b == nil {
+	if b == nil || !g.inUse() {
 		return nil
 	}
 	b.access.Lock()

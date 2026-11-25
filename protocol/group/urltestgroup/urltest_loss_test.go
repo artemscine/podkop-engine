@@ -145,6 +145,8 @@ func formattingLogger(t *testing.T) log.ContextLogger {
 
 func newModeGroup(t *testing.T, mode string, outbounds []adapter.Outbound, delays map[string]uint16, prepare func(group *URLTestGroup)) (*URLTest, *URLTestGroup) {
 	urlTest, group := newTestFallbackGroup(t, "", "", outbounds, nil, nil)
+	// its probes end with the test: the probes of the process come one after another
+	t.Cleanup(func() { group.Close() })
 	group.logger = formattingLogger(t)
 	var err error
 	group.mode, group.loss, err = groupMode(mode, "http://127.0.0.1:1/loss", 0, 0, 0, 0)
@@ -156,6 +158,8 @@ func newModeGroup(t *testing.T, mode string, outbounds []adapter.Outbound, delay
 	if prepare != nil {
 		prepare(group)
 	}
+	// the loss probes of a group run while it is in use
+	group.lastUse.Store(time.Now())
 	for tag, delay := range delays {
 		setResult(group, tag, delay)
 	}

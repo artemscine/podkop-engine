@@ -204,6 +204,7 @@ func (s *URLTest) Selected(network string) adapter.Outbound {
 
 func (s *URLTest) AttachConnection(closer io.Closer) func() {
 	s.group.Touch()
+	s.group.used()
 	return s.group.interruptGroup.Add(closer, true)
 }
 
@@ -275,6 +276,7 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
+	s.group.usedBy(ctx)
 	var outbound adapter.Outbound
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
@@ -336,6 +338,7 @@ func memberError(member adapter.Outbound, err error) error {
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
+	s.group.usedBy(ctx)
 	outbound := s.group.selectedOutboundUDP.Load()
 	balanced, release := s.group.balanced(ctx, N.NetworkUDP)
 	if balanced != nil {
@@ -388,6 +391,8 @@ type URLTestGroup struct {
 	close                        chan struct{}
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
+	lastUse                      common.TypedValue[time.Time] // of a connection that is no test (used)
+	usedSince                    common.TypedValue[time.Time] // when the group came into use last (used)
 	updatePending                atomic.Bool
 	confirmAccess                sync.Mutex
 	confirms                     map[string]*memberConfirm
@@ -422,8 +427,9 @@ type URLTestGroup struct {
 	mode         string
 	loss         lossOptions
 	balance      atomic.Pointer[balancer]
+	useStart     sync.Mutex // held while the group comes into use (startUse)
 	lossRunning  atomic.Bool
-	switchProbes sync.Map // member tag → a probe before a switch to it runs
+	switchProbes sync.Map // member tag → when the probe before a switch to it that runs began
 	switchProbed sync.Map // member tag → when the last probe before a switch to it began
 }
 
@@ -505,7 +511,13 @@ func (g *URLTestGroup) Touch() {
 	g.ticker = ticker
 	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
 	g.keepTicking()
-	go g.loopCheck(ticker, g.close)
+	// told here, not by the loop: a connection of the router touches the group as it is attached and
+	// again as it is dialed, the second time before the loop runs (podkop-engine)
+	idle := time.Since(g.lastActive.Load()) > g.interval
+	if idle {
+		g.lastActive.Store(time.Now())
+	}
+	go g.loopCheck(ticker, g.close, idle)
 }
 
 func (g *URLTestGroup) Close() error {
@@ -663,9 +675,10 @@ func (g *URLTestGroup) isFallback(detour adapter.Outbound) bool {
 	return len(g.fallbacks) > 0 && common.Contains(g.fallbacks, detour)
 }
 
-func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {
-	if time.Since(g.lastActive.Load()) > g.interval {
-		g.lastActive.Store(time.Now())
+// loopCheck runs a round an interval, and one at once for a group that was idle, until it is idle
+// again.
+func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}, idle bool) {
+	if idle {
 		g.CheckOutbounds(g.ctx, false)
 	}
 	for {

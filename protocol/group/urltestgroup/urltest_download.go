@@ -104,6 +104,15 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 			// made it a candidate again: it is tested, or it would keep out, by the
 			// tolerance, a member that has recovered meanwhile
 		}
+		// the switch waits for a count of the candidate: the member in use stays until the probe
+		// is done, and the selection then runs again with what it counted. A fallback is chosen by
+		// its place in the list, whatever it loses: nothing to wait for
+		waits := g.mode == modeLoss && currentAlive && candidate != current && !g.isFallback(candidate)
+		if waits && g.switchProbeRuns(tag) {
+			// without another download test: the selection after the probe makes the one before
+			// the switch
+			break
+		}
 		if g.downloadLink != "" && !downloaded[tag] {
 			start := time.Now()
 			if g.downloadStopped(tag, candidate) {
@@ -118,9 +127,7 @@ func (g *URLTestGroup) selectTested() (adapter.Outbound, bool) {
 			g.setFrozen(tag, time.Time{})
 			downloaded[tag] = true
 		}
-		if g.mode == modeLoss && currentAlive && candidate != current && g.needsSwitchProbe(tag) {
-			// the switch waits for a count of the candidate: the member in use stays until the
-			// probe is done, and the selection then runs again with what it counted
+		if waits && g.needsSwitchProbe(tag) {
 			g.startSwitchProbe(tag, candidate)
 			break
 		}

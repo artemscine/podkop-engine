@@ -300,7 +300,7 @@ func (f *utlsFallback) load(serverName string, destination M.Socksaddr) {
 	if f.key != "" {
 		return
 	}
-	f.key = F.ToString(f.candidates[f.configured].name, " ", serverName, " ", destination)
+	f.key = adapter.DetectOutcomeKey(f.candidates[f.configured].name, serverName, destination)
 	f.cache = service.FromContext[adapter.CacheFile](f.ctx)
 	if f.cache == nil {
 		return

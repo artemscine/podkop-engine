@@ -1,13 +1,13 @@
 package urltestgroup
 
 import (
-	basegroup "github.com/sagernet/sing-box/protocol/group"
 	"net"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	basegroup "github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common/bufio"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -62,6 +62,9 @@ func (s *URLTest) TakeOver(previous adapter.Outbound) {
 		}
 		g.frozen.Store(kept)
 	}
+	// a group in use goes on as one: its loss probes do not wait for the next connection
+	g.lastUse.Store(from.lastUse.Load())
+	g.usedSince.Store(from.usedSince.Load())
 	// Recovery is evidence about the same server objects, not merely their reusable tags.
 	// Copy it: an in-flight round of the retiring group must not change the successor's proof.
 	if sameCheck {

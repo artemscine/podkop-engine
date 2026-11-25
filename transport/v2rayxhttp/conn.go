@@ -2,6 +2,7 @@ package v2rayxhttp
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/common/readwait"
+	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing/common/baderror"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -519,10 +521,17 @@ func (s *session) NeedAdditionalReadDeadline() bool {
 // in crypto/tls and makes that client's read loop spin on it forever.
 type transportError struct {
 	message string
+	// the one thing of the error hidden that is told: the server is not the REALITY server it
+	// should be
+	realityVerification bool
 }
 
 func (e *transportError) Error() string {
 	return e.message
+}
+
+func (e *transportError) Is(target error) bool {
+	return e.realityVerification && target == tls.ErrRealityVerification
 }
 
 func hideHTTPError(err error) error {
@@ -536,5 +545,5 @@ func hideHTTPError(err error) error {
 	if _, isHidden := err.(*transportError); isHidden {
 		return err
 	}
-	return &transportError{err.Error()}
+	return &transportError{err.Error(), errors.Is(err, tls.ErrRealityVerification)}
 }

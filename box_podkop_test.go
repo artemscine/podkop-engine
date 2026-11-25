@@ -315,6 +315,9 @@ func TestUpdateOutboundsGivesTheBalanceBack(t *testing.T) {
 			Balance() []urltestgroup.BalanceMember
 		}).Balance() != nil
 	}
+	// the balance of a group that is not in use rests
+	require.False(t, balancing())
+	h.dial(group)
 	require.True(t, balancing())
 
 	_, err = h.update(`{"type": "testserver", "tag": "s4", "fail_late": true}, `+balance("s1", "s2", "s4"), nil, 0)

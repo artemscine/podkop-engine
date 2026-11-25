@@ -112,7 +112,7 @@ func failList(t *testing.T, ctx context.Context, config Config, first error, oth
 
 // firstRefused is what the first candidate meets at a server that takes it for a stranger's.
 func firstRefused() error {
-	return &realityStrangerError{E.New(realityVerificationFailed)}
+	return &realityStrangerError{new(realityVerifyError)}
 }
 
 // No ClientHello answered: no answer, and nothing else; a list that ends so does not say the
@@ -131,7 +131,7 @@ func TestDetectOutcomeNoAnswer(t *testing.T) {
 func TestDetectOutcomeWrongKey(t *testing.T) {
 	cache := &choiceCache{choices: make(map[string]choiceEntry)}
 	config, ctx := outcomeClient(t, cache)
-	failList(t, ctx, config, firstRefused(), E.New(realityVerificationFailed))
+	failList(t, ctx, config, firstRefused(), new(realityVerifyError))
 	entry := outcomeOf(t, cache, writerOf(config))
 	require.Equal(t, adapter.DetectFailed, entry.flags)
 	require.Empty(t, entry.fingerprint)
@@ -213,17 +213,17 @@ func TestDetectOutcomeFailedOnSavedChoice(t *testing.T) {
 	failSaved(ctx, io.ErrUnexpectedEOF)
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	failSaved(canceled, E.New(realityVerificationFailed))
+	failSaved(canceled, new(realityVerifyError))
 	settled(t, writer)
 	require.Equal(t, adapter.DetectRefused, outcomeOf(t, cache, writer).flags)
 
-	failSaved(ctx, E.New(realityVerificationFailed))
+	failSaved(ctx, new(realityVerifyError))
 	entry := outcomeOf(t, cache, writer)
 	require.Equal(t, adapter.DetectRefused|adapter.DetectFailed, entry.flags)
 	require.Empty(t, entry.fingerprint)
 	// the same state again writes nothing
 	writes := cache.outcomeWriteCount()
-	failSaved(ctx, E.New(realityVerificationFailed))
+	failSaved(ctx, new(realityVerifyError))
 	settled(t, writer)
 	require.Equal(t, writes, cache.outcomeWriteCount())
 
@@ -547,9 +547,9 @@ func TestDetectOutcomeFallbackOff(t *testing.T) {
 
 	// a failed verification, in each form it comes in
 	for _, failure := range []error{
-		E.New(realityVerificationFailed),
+		new(realityVerifyError),
 		firstRefused(),
-		E.Cause(errors.New("x"), realityVerificationFailed),
+		&realityVerifyError{cause: errors.New("x")},
 	} {
 		recorder.recordDetectOutcome(context.Background(), fallbackServer, failure)
 		entry = outcomeOf(t, cache, writer)

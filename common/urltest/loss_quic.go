@@ -101,6 +101,7 @@ func LossProbeQUIC(ctx context.Context, link string, size int64, detour N.Dialer
 	}
 	destination := M.ParseSocksaddrHostPortStr(linkURL.Hostname(), port)
 	byParameter := linkURL.Query().Has("bytes")
+	ctx = ContextWithTest(ctx)
 	start := time.Now()
 	// a stream held open across the probe, dialed before the first count: a member whose connection
 	// was idle dials it now, and the connection stays while the HTTP connections of the probe close

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -411,15 +412,28 @@ func TestGroupFastestOrder(t *testing.T) {
 }
 
 // "fastest" measures every member with background copies, then asks the fastest, fails
-// over to the next fastest, and refreshes old measurements without delaying a reply.
+// over to the next fastest, and refreshes old measurements without delaying a reply. The time is
+// the test's own (synctest): an answer takes as long as its server says, however busy the host is.
 func TestGroupFastest(t *testing.T) {
 	t.Parallel()
-	slow := newGroupTestMember("slow", groupTestAnswer(1, 80*time.Millisecond))
-	fast := newGroupTestMember("fast", groupTestAnswer(2, 5*time.Millisecond))
-	mid := newGroupTestMember("mid", groupTestAnswer(3, 40*time.Millisecond))
+	synctest.Test(t, testGroupFastest)
+}
+
+func testGroupFastest(t *testing.T) {
+	const slowDelay, fastDelay, midDelay = 80 * time.Millisecond, 5 * time.Millisecond, 40 * time.Millisecond
+	slow := newGroupTestMember("slow", groupTestAnswer(1, slowDelay))
+	fast := newGroupTestMember("fast", groupTestAnswer(2, fastDelay))
+	mid := newGroupTestMember("mid", groupTestAnswer(3, midDelay))
 	group, _ := newGroupTest(t, nil, C.DNSGroupStrategyFastest, false, slow, fast, mid)
 	measured := func(tag string) func() bool {
 		return func() bool { return group.testMember(tag).SmoothedTime > 0 }
+	}
+	// expectFast: fast answers, in its own time, whatever copies are on their way
+	expectFast := func() {
+		t.Helper()
+		if elapsed := groupTestExpect(t, group, "10.0.0.2"); elapsed != fastDelay {
+			t.Errorf("fast answered after %v", elapsed)
+		}
 	}
 	// nothing measured: the order of the list; a copy measures the first not measured
 	groupTestExpect(t, group, "10.0.0.1")
@@ -427,27 +441,31 @@ func TestGroupFastest(t *testing.T) {
 	if mid.asked() != 0 {
 		t.Fatal("more than one copy for one query")
 	}
-	groupTestExpect(t, group, "10.0.0.2") // measured before mid, which is not
+	expectFast() // measured before mid, which is not
+	// the copy to mid is on its way
+	synctest.Wait()
+	if mid.asked() != 1 || measured("mid")() {
+		t.Fatalf("mid asked %d times", mid.asked())
+	}
+	expectFast()
 	waitFallbackTest(t, "mid is measured", measured("mid"))
 	for i := 0; i < 5; i++ {
-		// the copies to the others (old measurements) never delay the reply of fast
-		if elapsed := groupTestExpect(t, group, "10.0.0.2"); elapsed > 35*time.Millisecond {
-			t.Errorf("fast answered after %v", elapsed)
-		}
+		expectFast()
 	}
 	state := group.GroupState()
-	if !(state.Members[1].SmoothedTime < state.Members[2].SmoothedTime && state.Members[2].SmoothedTime < state.Members[0].SmoothedTime) {
+	if state.Members[1].SmoothedTime != fastDelay || state.Members[2].SmoothedTime != midDelay || state.Members[0].SmoothedTime != slowDelay {
 		t.Fatalf("smoothed times %+v", state.Members)
 	}
 
-	// old measurements are refreshed: one copy per query, to the oldest one
+	// old measurements are refreshed: one copy per query, to the oldest one, and the copies to the
+	// others never delay the reply of fast
 	time.Sleep(groupTestTiming.staleAfter + 50*time.Millisecond)
 	slowAsked, midAsked := slow.asked(), mid.asked()
-	groupTestExpect(t, group, "10.0.0.2")
+	expectFast()
 	waitFallbackTest(t, "a copy to slow", func() bool { return slow.asked() == slowAsked+1 })
-	groupTestExpect(t, group, "10.0.0.2")
+	expectFast()
 	waitFallbackTest(t, "a copy to mid", func() bool { return mid.asked() == midAsked+1 })
-	groupTestExpect(t, group, "10.0.0.2")
+	expectFast()
 	time.Sleep(100 * time.Millisecond)
 	if slow.asked() != slowAsked+1 || mid.asked() != midAsked+1 {
 		t.Errorf("copies sent to fresh measurements: slow %d, mid %d", slow.asked()-slowAsked, mid.asked()-midAsked)
